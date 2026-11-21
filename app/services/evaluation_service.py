@@ -83,17 +83,68 @@ class EvaluationService:
         ink_map = Preprocessor.extract_ink_channel(aligned_bgr)
         is_200q = (len(left_m) >= 53 or len(right_m) >= 53) or (exam and exam.total_questions == 200)
 
-        # 2. Bubble detection (auto-select template matching exam total questions)
-        total_q = 200 if is_200q else (exam.total_questions if (exam and exam.total_questions) else 160)
-        template = get_template(total_q)
-        detector = BubbleDetector(template)
-        detected_results = detector.analyze_sheet(ink_map, timing_marks=(left_m, right_m))
+        # The key PDF only tells us how many questions to expect:
+        # its item count is the question count, nothing about layout.
+        expected_q = None
+        try:
+            if answer_key is not None and answer_key.items:
+                expected_q = len(answer_key.items)
+        except Exception:
+            expected_q = None
+        if not expected_q:
+            expected_q = exam.total_questions if (exam and exam.total_questions) else 160
+
+        # 2. Dynamic detection first — no layout, no fixed coordinates.
+        #    Find the label, read the boxes on the same line; find the
+        #    question number, read the 4 circles on the same line.
+        #    Falls back to the fixed template below when it cannot
+        #    find enough of the sheet.
+        detected_results = None
+        ht_text = name_text = ""
+        ocr_conf = 0.0
+        ht_valid = False
+        used_dynamic = False
+        try:
+            from app.omr.dynamic import (
+                analyze_sheet_dynamic, dynamic_rows_to_detected)
+            dyn = analyze_sheet_dynamic(
+                aligned_bgr, expected_questions=expected_q, ocr_engine=self.ocr)
+            if dyn.method == "dynamic" and dyn.found_questions >= 1:
+                detected_results = dynamic_rows_to_detected(dyn)
+                if dyn.identity.hall_ticket or dyn.identity.name:
+                    import re as _re
+                    _ht = dyn.identity.hall_ticket or ""
+                    _nm = dyn.identity.name or ""
+                    # Only trust dynamic identity if it looks like a
+                    # real hall ticket / name; otherwise the fixed
+                    # reader below gets a chance instead.
+                    if _ht and not _re.match(r"^[A-Z0-9]{4,20}$", _ht):
+                        _ht = ""
+                    if _nm and len(_nm) < 3:
+                        _nm = ""
+                    ht_text, name_text = _ht, _nm
+                    ocr_conf = dyn.identity.confidence
+                    ht_valid = bool(_ht)
+                used_dynamic = True
+        except Exception:
+            detected_results = None
+            used_dynamic = False
+
+        if detected_results is None:
+            # 2b. Fallback: fixed template matching exam total questions.
+            total_q = 200 if is_200q else (exam.total_questions if (exam and exam.total_questions) else 160)
+            template = get_template(total_q)
+            detector = BubbleDetector(template)
+            detected_results = detector.analyze_sheet(ink_map, timing_marks=(left_m, right_m))
 
         # 3. Student Identification (Hall Ticket and Candidate Name)
-        prefix = exam.code.strip() if (exam and exam.code and exam.code.strip()) else None
-        ht_text, name_text, ocr_conf, ht_valid = self.ocr.extract_identity(
-            aligned_bgr, exam_prefix=prefix, is_200q=is_200q
-        )
+        #    Only run the fixed-position reader when dynamic did not
+        #    already find the identity.
+        if not ht_text and not name_text:
+            prefix = exam.code.strip() if (exam and exam.code and exam.code.strip()) else None
+            ht_text, name_text, ocr_conf, ht_valid = self.ocr.extract_identity(
+                aligned_bgr, exam_prefix=prefix, is_200q=is_200q
+            )
         ht_conf = ocr_conf
         name_conf = ocr_conf
 
