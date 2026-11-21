@@ -1,0 +1,14 @@
+# Pinned dependencies for Offline OMR Evaluation System
+# Fully offline runtime after installation
+
+PySide6==6.11.2
+opencv-python==5.0.0.93
+pymupdf==1.28.2
+rapidocr-onnxruntime==1.2.3
+onnxruntime==1.22.1
+numpy==2.3.1
+pandas==2.3.1
+openpyxl==3.1.5
+pytest==9.1.1
+pyinstaller==6.18.0
+

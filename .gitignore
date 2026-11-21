@@ -1,0 +1,39 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# PyInstaller builds
+build/
+dist/
+dist_onefile/
+
+# Runtime directories
+logs/
+exports/
+debug_id_crops/
+processed_crops/
+data/*.db
+data/.write_test
+crash.log
+
+# Temporary test crops & debug images
+crop_*.png
+test_*.png
+wide_*.png
+real_*.png
+r60_*.png
+325361_*.png
+325365_*.png
+omr_325384_top.png
+OMR_32537*_wide.png
+box_*.png
+omr_*.png
+!OMR_200_Sheet_Template*.png
+*_processed.png
+debug_*.jpg
+b14_*.png
+325610_*.png
+
+
