@@ -718,10 +718,62 @@ def process_folder(
             aligned, angle = Preprocessor.align_and_deskew(img)
             is_200q = (len(left_marks) >= 53 or len(right_marks) >= 53)
 
+            # Dynamic path when the warped top is cut off (200Q Syam
+            # sheet): the hall-ticket row maps above y=0, so the fixed
+            # reader below crops the Instructions box instead of the
+            # hall-ticket boxes — that is the wrong ht/name crop this
+            # script used to save. Same selection rule as
+            # EvaluationService: a box row touching the top edge of the
+            # warped image means the top is cut off, so read the
+            # deskewed-only copy (whole page in frame) with dynamic
+            # detection instead. When the top is intact, the fixed
+            # reader below runs exactly as before.
+            dyn = None
+            use_dynamic = False
+            try:
+                from app.omr.dynamic import (
+                    analyze_sheet_dynamic, dynamic_rows_to_detected,
+                    identity_crops, top_is_cut_off,
+                )
+                if top_is_cut_off(aligned):
+                    deskewed = Preprocessor.deskew_only(img)[0]
+                    dyn = analyze_sheet_dynamic(
+                        deskewed, expected_questions=num_questions,
+                        ocr_engine=engine)
+                    use_dynamic = (dyn.method == "dynamic"
+                                   and dyn.found_questions >= 1)
+            except Exception:
+                dyn = None
+                use_dynamic = False
+
             # 2. Extract Student Identity (HT / Name)
-            ht, name, conf, valid, crops = engine.extract_identity(
-                aligned, exam_prefix=active_prefix, roster=roster_records, return_crops=True, is_200q=is_200q
-            )
+            if use_dynamic:
+                ht = dyn.identity.hall_ticket or ""
+                name = dyn.identity.name or ""
+                conf = dyn.identity.confidence
+                valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                # Roster reconciliation, same as the fixed reader does
+                # when a roster is present in the folder.
+                if roster_records and (ht or name):
+                    try:
+                        r_ht, r_name = engine._reconcile_with_roster(
+                            ht, name, ht, roster_records,
+                            preferred_prefix=active_prefix)
+                        if r_ht:
+                            ht = r_ht
+                        if r_name:
+                            name = r_name
+                    except Exception:
+                        pass
+                crops = identity_crops(deskewed, dyn.identity, engine)
+                if not ht and not name:
+                    # Dynamic found nothing usable: fall back to the
+                    # fixed reader below.
+                    use_dynamic = False
+            if not use_dynamic:
+                ht, name, conf, valid, crops = engine.extract_identity(
+                    aligned, exam_prefix=active_prefix, roster=roster_records, return_crops=True, is_200q=is_200q
+                )
 
             # Save cropped debug images
             ht_crop_file = target_folder / f"{fpath.stem}_ht_processed.png"
@@ -747,11 +799,17 @@ def process_folder(
             detected_results = {}
 
             if has_evaluation:
-                ink_map = Preprocessor.extract_ink_channel(aligned)
-                detected_results = bubble_detector.analyze_sheet(
-                    ink_map,
-                    timing_marks=(left_marks, right_marks)
-                )
+                if use_dynamic:
+                    # Same dynamic bubble grid as EvaluationService, on
+                    # the deskewed copy — the fixed template misreads
+                    # this sheet badly (69 unattempted on the old run).
+                    detected_results = dynamic_rows_to_detected(dyn)
+                else:
+                    ink_map = Preprocessor.extract_ink_channel(aligned)
+                    detected_results = bubble_detector.analyze_sheet(
+                        ink_map,
+                        timing_marks=(left_marks, right_marks)
+                    )
                 _, correct_cnt, wrong_cnt, unattempted_cnt, total_marks, _, _ = scoring_engine.evaluate_sheet(
                     detected_results, answer_key.items
                 )
