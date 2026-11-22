@@ -573,6 +573,11 @@ def _grid_rows_from_columns(image_bgr: np.ndarray,
         candidate-centre x histogram inside that column; when too
         few candidates are found they fall back to even spacing
         across the column width.
+      * each row's y is snapped to the median candidate y near its
+        grid line: the pitch from the column rectangle is slightly
+        too large (the pink band runs past the last bubble row), so
+        a single offset cannot fit all rows — the top rows sit ~8 px
+        above the grid and the bottom rows ~10 px below it.
     """
     h, w = image_bgr.shape[:2]
     scale = w / 1644.0
@@ -617,6 +622,18 @@ def _grid_rows_from_columns(image_bgr: np.ndarray,
         radius = float(np.clip(col_w * 0.065, 7 * scale, 14 * scale))
         for i in range(rows_per_col):
             cy = y1 + pitch_y * (i + 0.5) + y_off
+            if cands:
+                # Snap the row to the real bubbles: candidates within
+                # half a pitch of the grid line belong to this row
+                # (neighbours are a full pitch away); their median y
+                # is the row's true centre. Without this the last
+                # rows of a column drift ~10 px low, so their
+                # windows miss the bubbles (Q120/Q200 read blank)
+                # and catch the next row's marks (Q78 read as
+                # AMBIGUOUS). Rows with no candidates keep the grid.
+                near = [c[1] for c in cands if abs(c[1] - cy) <= pitch_y / 2.0]
+                if near:
+                    cy = float(np.median(near))
             for cx in centres_x:
                 out.append((float(cx), float(cy), radius, float(x1)))
     return out
