@@ -178,6 +178,24 @@ def find_box_rows(image_bgr: np.ndarray,
     return merged
 
 
+def top_is_cut_off(image_bgr: np.ndarray) -> bool:
+    """True when the top of the page looks cut off in this image.
+
+    The track-warped alignment can push the hall-ticket row above
+    y=0 when the timing track is only partially detected (200Q Syam
+    sheet: first detected mark far below the real top of the track).
+    What remains is a box row sliver touching the top edge (y1 == 0)
+    — a real box row never starts at the very top of the page.
+    Callers use this to switch dynamic detection to a deskewed-only
+    copy of the raw scan, where the whole page stays in frame.
+    """
+    try:
+        rows = find_box_rows(image_bgr)
+    except Exception:
+        return False
+    return any(r.y1 <= 2 for r in rows)
+
+
 def _normalise_text(text: str) -> str:
     return re.sub(r"[^a-z ]", " ", text.lower()).strip()
 
