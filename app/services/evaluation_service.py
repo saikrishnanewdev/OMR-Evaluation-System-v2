@@ -81,6 +81,30 @@ class EvaluationService:
 
         aligned_bgr, skew_angle = Preprocessor.align_and_deskew(raw_bgr)
         ink_map = Preprocessor.extract_ink_channel(aligned_bgr)
+        # Dynamic detection normally runs on the warped `aligned_bgr`
+        # (that is the path proven on the 160Q sample: 107/53/53.5).
+        # But the warp can cut the top of the page off when the timing
+        # track is only partially detected — on the 200Q Syam sheet
+        # the first detected mark sat far below the real top of the
+        # track, so the hall-ticket row mapped to y < 0 and identity
+        # came back blank (old tool) or garbage (dynamic on warped).
+        # A box row touching the top edge (y1 == 0) is the tell-tale
+        # sign of that cut-off. In that case dynamic runs on a
+        # deskewed-only copy of the raw scan instead (see
+        # Preprocessor.deskew_only), where the whole page stays in
+        # frame; the fixed-template fallback still uses the warped
+        # image as before.
+        try:
+            deskewed_bgr, _ = Preprocessor.deskew_only(raw_bgr)
+        except Exception:
+            deskewed_bgr = aligned_bgr
+        dyn_image = aligned_bgr
+        try:
+            from app.omr.dynamic import top_is_cut_off
+            if top_is_cut_off(aligned_bgr):
+                dyn_image = deskewed_bgr
+        except Exception:
+            pass
         is_200q = (len(left_m) >= 53 or len(right_m) >= 53) or (exam and exam.total_questions == 200)
 
         # The key PDF only tells us how many questions to expect:
@@ -108,7 +132,7 @@ class EvaluationService:
             from app.omr.dynamic import (
                 analyze_sheet_dynamic, dynamic_rows_to_detected)
             dyn = analyze_sheet_dynamic(
-                aligned_bgr, expected_questions=expected_q, ocr_engine=self.ocr)
+                dyn_image, expected_questions=expected_q, ocr_engine=self.ocr)
             if dyn.method == "dynamic" and dyn.found_questions >= 1:
                 detected_results = dynamic_rows_to_detected(dyn)
                 if dyn.identity.hall_ticket or dyn.identity.name:
