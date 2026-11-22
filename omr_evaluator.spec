@@ -39,6 +39,15 @@ a = Analysis(
         'rapidocr_onnxruntime',
         'onnxruntime',
         'pytesseract',
+        # 'six' is imported by rapidocr_onnxruntime/ch_ppocr_v3_det/utils.py,
+        # loaded dynamically via importlib, so PyInstaller's static scan
+        # misses it — same crash class as pytesseract before it. The three
+        # subpackages are also loaded dynamically (Det/Rec/Cls), so list
+        # them explicitly too.
+        'six',
+        'rapidocr_onnxruntime.ch_ppocr_v3_det',
+        'rapidocr_onnxruntime.ch_ppocr_v3_rec',
+        'rapidocr_onnxruntime.ch_ppocr_v2_cls',
         'openpyxl',
         'openpyxl.styles',
         'pandas',
