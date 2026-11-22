@@ -38,6 +38,7 @@ a = Analysis(
         'pymupdf',
         'rapidocr_onnxruntime',
         'onnxruntime',
+        'pytesseract',
         'openpyxl',
         'openpyxl.styles',
         'pandas',
