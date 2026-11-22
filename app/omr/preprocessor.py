@@ -138,6 +138,37 @@ class Preprocessor:
         return left_marks, right_marks, skew_angle
 
     @classmethod
+    def deskew_only(
+        cls, image_bgr: np.ndarray
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Rotates out the detected skew without warping to the reference
+        canvas, so the whole page stays in frame.
+
+        The track-warped ``align_and_deskew`` output can push the top
+        of the page off the canvas when the timing track is only
+        partially detected: on the 200Q Syam sheet the first detected
+        mark sat far below the real top of the track, so the
+        hall-ticket row mapped to y < 0 and identity came back blank
+        (or garbage from the sliver left at y=0). Dynamic detection
+        finds everything from the image itself, so it wants the full
+        page — use this for the dynamic path and keep the warped
+        image for the fixed-template fallback only.
+        Returns: (deskewed_image_bgr, detected_skew_angle)
+        """
+        h, w = image_bgr.shape[:2]
+        _, _, skew_angle = cls.detect_timing_tracks(image_bgr)
+        if abs(skew_angle) < 0.05:
+            return image_bgr.copy(), skew_angle
+        center = (w / 2.0, h / 2.0)
+        rot_mat = cv2.getRotationMatrix2D(center, -skew_angle, 1.0)
+        deskewed = cv2.warpAffine(
+            image_bgr, rot_mat, (w, h),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        )
+        return deskewed, skew_angle
+
+    @classmethod
     def align_and_deskew(
         cls, image_bgr: np.ndarray, target_w: int = REF_CANVAS_WIDTH, target_h: int = REF_CANVAS_HEIGHT
     ) -> Tuple[np.ndarray, float]:
