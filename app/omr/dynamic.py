@@ -272,6 +272,53 @@ def _row_for_label(rows: List[BoxRow], labels: List[Dict],
 # Reading a box row (hall ticket / name)
 # ---------------------------------------------------------------------------
 
+def _row_strip_images(image_bgr: np.ndarray, row: BoxRow,
+                      ocr_engine=None):
+    """Raw + cleaned strip images for one box row.
+
+    Raw is the row as cropped from the image; cleaned is the same
+    strip after the OCREngine cleaning (red dropout, 2.5x zoom, white
+    padding) — the images the review UI shows as the ht/name crops.
+    Returns (None, None) when the row has no pixels.
+    """
+    raw = image_bgr[max(0, row.y1 - 2):row.y2 + 2,
+                    max(0, row.x1 - 2):row.x2 + 2]
+    if raw.size == 0:
+        return None, None
+    strip = raw
+    remove_red = getattr(ocr_engine, "remove_red_color", None) if ocr_engine else None
+    if remove_red is not None:
+        strip = remove_red(strip)
+    zoomed = cv2.resize(strip, None, fx=2.5, fy=2.5,
+                        interpolation=cv2.INTER_CUBIC)
+    pad = cv2.copyMakeBorder(zoomed, 15, 15, 30, 30,
+                             cv2.BORDER_CONSTANT, value=[255, 255, 255])
+    return raw, pad
+
+
+def identity_crops(image_bgr: np.ndarray, identity: "DynamicIdentity",
+                   ocr_engine=None) -> Dict:
+    """Crop images for a dynamic identity, in the same shape as the
+    fixed reader's crops dict (ht_processed, name_processed, ht_raw,
+    name_raw, ht_missing_on_sheet), so callers can display them the
+    same way. A missing row yields a blank white placeholder image.
+    """
+    crops: Dict = {"ht_missing_on_sheet": False}
+    for key, row in (("ht", identity.hall_ticket_row),
+                     ("name", identity.name_row)):
+        blank = np.full((50, 200, 3), 255, dtype=np.uint8)
+        if row is None:
+            crops[f"{key}_raw"] = blank
+            crops[f"{key}_processed"] = blank
+            if key == "ht":
+                crops["ht_missing_on_sheet"] = True
+            continue
+        raw, pad = _row_strip_images(image_bgr, row, ocr_engine)
+        crops[f"{key}_raw"] = raw if raw is not None else blank
+        crops[f"{key}_processed"] = pad if pad is not None else blank
+    return crops
+
+
 def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
                        ocr_engine=None) -> str:
     """Read the handwriting in one box row using the existing OCR engine.
@@ -284,18 +331,9 @@ def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
     if ocr_engine is None:
         return ""
     try:
-        strip = image_bgr[max(0, row.y1 - 2):row.y2 + 2,
-                          max(0, row.x1 - 2):row.x2 + 2]
-        if strip.size == 0:
+        _raw, pad = _row_strip_images(image_bgr, row, ocr_engine)
+        if pad is None:
             return ""
-        # Same cleaning as OCREngine: red dropout, then 2.5x zoom.
-        remove_red = getattr(ocr_engine, "remove_red_color", None)
-        if remove_red is not None:
-            strip = remove_red(strip)
-        zoomed = cv2.resize(strip, None, fx=2.5, fy=2.5,
-                            interpolation=cv2.INTER_CUBIC)
-        pad = cv2.copyMakeBorder(zoomed, 15, 15, 30, 30,
-                                 cv2.BORDER_CONSTANT, value=[255, 255, 255])
         h, w = pad.shape[:2]
         scaled = cv2.resize(pad, (int(w * 48.0 / h), 48),
                             interpolation=cv2.INTER_AREA)
