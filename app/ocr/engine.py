@@ -13,19 +13,27 @@ import numpy as np
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 from rapidocr_onnxruntime import RapidOCR
-import pytesseract
+try:
+    # Optional: only used to point at a local Tesseract binary if one
+    # is installed. All real OCR goes through RapidOCR below, so the
+    # app must NOT crash at startup when this package is missing —
+    # that is what broke the first built .exe (ModuleNotFoundError).
+    import pytesseract
+except ImportError:  # pragma: no cover - missing optional dependency
+    pytesseract = None
 from app.omr.preprocessor import Preprocessor
 
 # Configure local offline Tesseract binary path if available
-TESSERACT_CANDIDATE_PATHS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
-]
-for p in TESSERACT_CANDIDATE_PATHS:
-    if os.path.exists(p):
-        pytesseract.pytesseract.tesseract_cmd = p
-        break
+if pytesseract is not None:
+    TESSERACT_CANDIDATE_PATHS = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
+    ]
+    for p in TESSERACT_CANDIDATE_PATHS:
+        if os.path.exists(p):
+            pytesseract.pytesseract.tesseract_cmd = p
+            break
 
 
 class OCREngine:
