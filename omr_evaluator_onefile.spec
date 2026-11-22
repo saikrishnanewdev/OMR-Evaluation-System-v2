@@ -39,6 +39,12 @@ a = Analysis(
         'rapidocr_onnxruntime',
         'onnxruntime',
         'pytesseract',
+        # See omr_evaluator.spec: 'six' and the dynamically loaded
+        # RapidOCR subpackages are invisible to PyInstaller's static scan.
+        'six',
+        'rapidocr_onnxruntime.ch_ppocr_v3_det',
+        'rapidocr_onnxruntime.ch_ppocr_v3_rec',
+        'rapidocr_onnxruntime.ch_ppocr_v2_cls',
         'openpyxl',
         'openpyxl.styles',
         'pandas',
