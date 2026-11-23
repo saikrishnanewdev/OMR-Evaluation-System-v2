@@ -844,7 +844,8 @@ def process_folder(
                     ink_map = Preprocessor.extract_ink_channel(aligned)
                     detected_results = bubble_detector.analyze_sheet(
                         ink_map,
-                        timing_marks=(left_marks, right_marks)
+                        timing_marks=(left_marks, right_marks),
+                        image_bgr=aligned
                     )
                 _, correct_cnt, wrong_cnt, unattempted_cnt, total_marks, _, _ = scoring_engine.evaluate_sheet(
                     detected_results, answer_key.items
