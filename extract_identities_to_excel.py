@@ -739,7 +739,8 @@ def process_folder(
                     deskewed = Preprocessor.deskew_only(img)[0]
                     dyn = analyze_sheet_dynamic(
                         deskewed, expected_questions=num_questions,
-                        ocr_engine=engine)
+                        ocr_engine=engine,
+                        exam_prefix=active_prefix or None)
                     use_dynamic = (dyn.method == "dynamic"
                                    and dyn.found_questions >= 1)
             except Exception:
