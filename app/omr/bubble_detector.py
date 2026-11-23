@@ -29,7 +29,8 @@ class BubbleDetector:
         self,
         ink_map: np.ndarray,
         blank_threshold: Optional[float] = None,
-        timing_marks: Optional[Tuple[List, List]] = None
+        timing_marks: Optional[Tuple[List, List]] = None,
+        image_bgr: Optional[np.ndarray] = None
     ) -> Dict[int, Dict]:
         """
         Processes all questions on the ink map.
@@ -42,6 +43,17 @@ class BubbleDetector:
             'max_fill': float,
             'ratio': float
         }
+
+        When image_bgr (the aligned colour sheet) is given, each
+        column's row y-centres are corrected to the real detected
+        circles (centre sampling, see dynamic
+        ._row_centres_from_candidates) instead of the template's
+        calibrated grid. The template grid can sit almost a full row
+        off when the warp shifts the sheet — on the 200Q Syam sheet
+        its rows are ~25 px below the real bubbles at the top of
+        each column, so it samples the next row's marks and leaves
+        17 near-miss blanks. The x positions stay from the template.
+        Without image_bgr the template positions are used as before.
         """
         h, w = ink_map.shape
         results = {}
@@ -49,9 +61,39 @@ class BubbleDetector:
         l_marks = timing_marks[0] if (timing_marks and len(timing_marks) == 2) else None
         r_marks = timing_marks[1] if (timing_marks and len(timing_marks) == 2) else None
 
+        # Centre sampling: one true row y per column per row, from
+        # the detected circles. None means "use the template y".
+        row_ys_by_col = None
+        if image_bgr is not None:
+            try:
+                from app.omr.dynamic import (
+                    _candidate_centres, _row_centres_from_candidates)
+                img_h, img_w = image_bgr.shape[:2]
+                row_ys_by_col = []
+                for col_idx in range(self.template.num_columns):
+                    base_x = self.template.column_base_x[col_idx]
+                    x1 = max(0, int(base_x - 30))
+                    x2 = min(img_w, int(base_x + 3 * self.template.option_pitch_x + 30))
+                    y1 = max(0, int(self.template.row_base_y - 40))
+                    y2 = min(img_h, int(self.template.row_base_y
+                                        + (self.template.questions_per_column - 1)
+                                        * self.template.row_pitch_y + 40))
+                    cands = _candidate_centres(image_bgr, (x1, y1, x2, y2))
+                    grid_ys = [self.template.row_base_y
+                               + i * self.template.row_pitch_y
+                               for i in range(self.template.questions_per_column)]
+                    row_ys_by_col.append(
+                        _row_centres_from_candidates(
+                            cands, self.template.questions_per_column,
+                            grid_ys))
+            except Exception:
+                row_ys_by_col = None
+
         for q_num in range(1, self.template.total_questions + 1):
             fills = []
             bg_levels = []
+            col_idx = (q_num - 1) // self.template.questions_per_column
+            row_idx = (q_num - 1) % self.template.questions_per_column
 
             for opt_idx in range(len(OPTION_NAMES)):
                 cx, cy = self.template.get_bubble_center(
@@ -59,6 +101,8 @@ class BubbleDetector:
                     timing_marks_left=l_marks,
                     timing_marks_right=r_marks
                 )
+                if row_ys_by_col is not None:
+                    cy = row_ys_by_col[col_idx][row_idx]
                 ix, iy = int(round(cx)), int(round(cy))
 
                 # Boundary safety check
