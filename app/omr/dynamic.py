@@ -685,6 +685,79 @@ def _histogram_peaks(values: List[float], bin_w: float,
     return sorted(peaks)
 
 
+def _row_centres_from_candidates(cands: List[Tuple[float, float]],
+                                 rows_per_col: int,
+                                 grid_ys: List[float],
+                                 tol: float = 10.0
+                                 ) -> List[float]:
+    """Row y-centres from the real detected circles (centre sampling).
+
+    Clusters the candidate circle y's into rows, in top-to-bottom
+    order, and returns one y per row. The grid y's are only a
+    reference: they decide which clusters to drop when there are too
+    many, and fill rows that have no cluster. A cluster is never
+    assigned to a row more than half a pitch from its grid line, so
+    a sample can never jump to the neighbour row's bubble — the
+    neighbour is a full pitch away.
+
+    Why this exists: on the 200Q Syam sheet the fixed template's
+    rows sit ~25 px (almost one full row) below the real bubbles at
+    the top of each column — its base y (1151) does not match the
+    sheet (first real row ~1123.5) — so the fixed reader samples the
+    next row's marks and scores 7 lucky corrects. The dynamic grid
+    has the same weakness in principle: its pitch comes from the
+    pink rectangle's height, which runs past the last bubble row.
+    Clusters in order cannot make that mistake: the first cluster
+    is the first row, because no row can hide above it inside the
+    column rectangle.
+    """
+    ys = sorted(c[1] for c in cands)
+    groups: List[List[float]] = []
+    for y in ys:
+        if groups and y - groups[-1][-1] <= tol:
+            groups[-1].append(y)
+        else:
+            groups.append([y])
+    # (median y, candidate count) per cluster, in order.
+    cl = [(float(np.median(g)), len(g)) for g in groups]
+    n = rows_per_col
+    if not cl:
+        return list(grid_ys)
+    if len(cl) == n:
+        return [c[0] for c in cl]
+    pitch = ((grid_ys[-1] - grid_ys[0]) / (n - 1)
+             if n > 1 else 30.0)
+    half = pitch / 2.0
+    if len(cl) > n:
+        # Too many clusters (a smudge, a stray mark): keep the n
+        # strongest ones — a real row has ~4-5 candidates — closest
+        # to the grid, then take them in order.
+        def _score(c):
+            return (c[1], -min(abs(c[0] - g) for g in grid_ys))
+        keep = sorted(sorted(cl, key=_score, reverse=True)[:n],
+                      key=lambda c: c[0])
+        return [c[0] for c in keep]
+    # Too few clusters: assign each cluster to its nearest grid row,
+    # in strictly increasing order, within half a pitch. Rows with no
+    # cluster keep the grid value. The half-pitch guard is what keeps
+    # this safe: a cluster more than half a pitch from every grid
+    # row is not forced onto a row (that is how a one-row jump used
+    # to happen). A plain shift search cannot express a gap in the
+    # middle of the column, so it is not used here.
+    out = list(grid_ys)
+    next_row = 0
+    for (cy, _cnt) in cl:
+        best, best_d = None, half
+        for i in range(next_row, n):
+            d = abs(cy - grid_ys[i])
+            if d <= best_d:
+                best, best_d = i, d
+        if best is not None:
+            out[best] = cy
+            next_row = best + 1
+    return out
+
+
 def _grid_rows_from_columns(image_bgr: np.ndarray,
                            columns: List[Tuple[int, int, int, int]],
                            expected_questions: Optional[int]
@@ -701,11 +774,13 @@ def _grid_rows_from_columns(image_bgr: np.ndarray,
         candidate-centre x histogram inside that column; when too
         few candidates are found they fall back to even spacing
         across the column width.
-      * each row's y is snapped to the median candidate y near its
-        grid line: the pitch from the column rectangle is slightly
-        too large (the pink band runs past the last bubble row), so
-        a single offset cannot fit all rows — the top rows sit ~8 px
-        above the grid and the bottom rows ~10 px below it.
+      * each row's y comes from the real detected circles, clustered
+        in order (see _row_centres_from_candidates): the pitch from
+        the column rectangle is slightly too large (the pink band
+        runs past the last bubble row), so a plain grid drifts a
+        full row by the bottom of a column, and snapping to the
+        median near a drifted grid line can lock onto the neighbour
+        row's circles. Clusters in order cannot jump a row.
     """
     h, w = image_bgr.shape[:2]
     scale = w / 1644.0
@@ -731,37 +806,20 @@ def _grid_rows_from_columns(image_bgr: np.ndarray,
             # Even spacing across the column, leaving room on the
             # left for the printed question number.
             centres_x = [x1 + col_w * (0.32 + 0.17 * k) for k in range(4)]
-        # Row y: refine the grid offset from candidate y's, if any.
-        y_off = 0.0
-        if cands:
-            ys = [c[1] for c in cands]
-            # Distance of each candidate y from the nearest grid line.
-            best_off, best_score = 0.0, -1
-            for off in range(-8, 9):
-                score = 0
-                for yy in ys:
-                    rel = (yy - y1 - pitch_y / 2.0 - off) % pitch_y
-                    d = min(rel, pitch_y - rel)
-                    if d < 4.0:
-                        score += 1
-                if score > best_score:
-                    best_off, best_score = off, score
-            y_off = float(best_off)
+        # Row y: centre sampling. The row centres come from the real
+        # detected circles (clustered in order), not from the pink
+        # rectangle's height: the rectangle is slightly taller than
+        # the bubble block, so its pitch is too large and a plain
+        # grid drifts a full row by the bottom of a column — and the
+        # old per-row median snap could then lock onto the neighbour
+        # row's circles. Clusters in order cannot jump a row; rows
+        # with no cluster keep the grid value.
+        grid_ys = [y1 + pitch_y * (i + 0.5) for i in range(rows_per_col)]
+        row_ys = _row_centres_from_candidates(cands, rows_per_col,
+                                              grid_ys)
         radius = float(np.clip(col_w * 0.065, 7 * scale, 14 * scale))
         for i in range(rows_per_col):
-            cy = y1 + pitch_y * (i + 0.5) + y_off
-            if cands:
-                # Snap the row to the real bubbles: candidates within
-                # half a pitch of the grid line belong to this row
-                # (neighbours are a full pitch away); their median y
-                # is the row's true centre. Without this the last
-                # rows of a column drift ~10 px low, so their
-                # windows miss the bubbles (Q120/Q200 read blank)
-                # and catch the next row's marks (Q78 read as
-                # AMBIGUOUS). Rows with no candidates keep the grid.
-                near = [c[1] for c in cands if abs(c[1] - cy) <= pitch_y / 2.0]
-                if near:
-                    cy = float(np.median(near))
+            cy = row_ys[i]
             for cx in centres_x:
                 out.append((float(cx), float(cy), radius, float(x1)))
     return out
