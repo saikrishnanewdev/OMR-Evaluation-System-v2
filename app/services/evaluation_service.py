@@ -159,7 +159,7 @@ class EvaluationService:
             total_q = 200 if is_200q else (exam.total_questions if (exam and exam.total_questions) else 160)
             template = get_template(total_q)
             detector = BubbleDetector(template)
-            detected_results = detector.analyze_sheet(ink_map, timing_marks=(left_m, right_m))
+            detected_results = detector.analyze_sheet(ink_map, timing_marks=(left_m, right_m), image_bgr=aligned_bgr)
 
         # 3. Student Identification (Hall Ticket and Candidate Name)
         #    Only run the fixed-position reader when dynamic did not
