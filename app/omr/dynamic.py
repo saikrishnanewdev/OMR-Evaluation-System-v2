@@ -37,7 +37,7 @@ Detection notes (from the Syam photos):
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -319,18 +319,138 @@ def identity_crops(image_bgr: np.ndarray, identity: "DynamicIdentity",
     return crops
 
 
+# A box counts as filled when it holds enough dark pen ink.
+# Calibrated on the real paths (200Q Syam sheet on the deskewed copy,
+# 160Q sample on the warped copy; ink > 60, 4 px inset from the box
+# edges): filled boxes scored 61+, empty boxes 41 or less.
+FILLED_BOX_MIN_INK = 45
+
+
+def _filled_box_span(image_bgr: np.ndarray, row: BoxRow):
+    """(first, last) index of the filled boxes in a box row, or None.
+
+    Students write left to right, so the text sits in one run of
+    filled boxes. The empty boxes after it must not be read: after
+    red dropout they still leave faint edges, and the recogniser
+    invents letters from them — the '1ZGG' / 'TDODLD' ghost tail
+    after a clean hall ticket / name. Returns None when no box is
+    filled (a blank field) or the row has no box list.
+    """
+    if not row.boxes:
+        return None
+    ink = ink_map(image_bgr)
+    filled = []
+    for i, (bx, by, bw, bh) in enumerate(row.boxes):
+        x1 = max(0, bx + 4)
+        x2 = min(ink.shape[1], bx + bw - 4)
+        y1 = max(0, by + 4)
+        y2 = min(ink.shape[0], by + bh - 4)
+        patch = ink[y1:y2, x1:x2]
+        count = int((patch > 60).sum()) if patch.size else 0
+        if count >= FILLED_BOX_MIN_INK:
+            filled.append(i)
+    if not filled:
+        return None
+    return filled[0], filled[-1]
+
+
+# Characters RapidOCR confuses, from OCREngine.CHAR_TO_DIGIT (letters
+# it reads as digits) and its digit_to_letter reverse.
+_LETTER_TO_DIGIT = {
+    "O": "0", "D": "0", "Q": "0", "U": "0",
+    "I": "1", "J": "1", "L": "1",
+    "Z": "2", "E": "3", "A": "4", "S": "5",
+    "G": "6", "T": "7", "B": "8", "g": "9",
+}
+
+
+def _looks_like(a: str, b: str) -> bool:
+    """True when a and b are the same character or a known look-alike."""
+    if a == b:
+        return True
+    return (_LETTER_TO_DIGIT.get(a) == b
+            or _LETTER_TO_DIGIT.get(b) == a)
+
+
+def correct_hall_ticket(text: str, prefix: Optional[str] = None,
+                        expected_len: Optional[int] = None) -> str:
+    """Fix look-alike misreads in a hall ticket.
+
+    With a trustworthy prefix (roster / batch / user-supplied exam
+    prefix): a character that differs from the prefix only by a
+    look-alike is replaced by the prefix character, and letters
+    after the prefix (the roll number) become digits. The prefix is
+    only trusted when every overlapping character matches it or
+    looks like it — a mismatched prefix is ignored, never applied,
+    so a wrong roster/batch prefix cannot corrupt the reading.
+    Without a prefix, only the safe trailing rule applies: letters
+    after the final digit run are digits (the fixed code already
+    did this for batch prefixes).
+
+    expected_len is the number of filled boxes in the row (one
+    character per box). When the text is exactly one character
+    short and the last prefix character was read as a digit that
+    looks like it (handwritten J + 1 fused into a single '1'), that
+    digit does double duty: it is both the prefix letter and the
+    first roll digit, so it is restored at the start of the roll.
+    """
+    if not text:
+        return text
+    text = text.upper()
+    if prefix:
+        prefix = prefix.upper().strip()
+        n = min(len(prefix), len(text))
+        if n >= 4 and all(_looks_like(text[i], prefix[i])
+                          for i in range(n)):
+            chars = list(text)
+            for i in range(n):
+                chars[i] = prefix[i]
+            roll = chars[n:]
+            if (expected_len is not None
+                    and expected_len - len(text) == 1
+                    and n > 0
+                    and text[n - 1].isdigit()
+                    and prefix[n - 1].isalpha()):
+                # Merged boundary character (see docstring).
+                roll = [text[n - 1]] + roll
+            for i, c in enumerate(roll):
+                roll[i] = _LETTER_TO_DIGIT.get(c, c)
+            return "".join(chars[:n] + roll)
+    chars = list(text)
+    i = len(chars) - 1
+    while i >= 0 and chars[i].isalpha() and chars[i] in _LETTER_TO_DIGIT:
+        if any(c.isdigit() for c in chars[:i]):
+            chars[i] = _LETTER_TO_DIGIT[chars[i]]
+            i -= 1
+        else:
+            break
+    return "".join(chars)
+
+
 def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
                        ocr_engine=None) -> str:
     """Read the handwriting in one box row using the existing OCR engine.
 
-    Crops the row, removes the red printed lines and zooms 2.5x first —
-    the same cleaning OCREngine uses for its fixed strips — then runs
-    the strip through RapidOCR's text recogniser. Returns "" when no
-    OCR engine is available.
+    Crops the row to the filled boxes only, removes the red printed
+    lines and zooms 2.5x first — the same cleaning OCREngine uses for
+    its fixed strips — then runs the strip through RapidOCR's text
+    recogniser. Returns "" when no OCR engine is available.
     """
     if ocr_engine is None:
         return ""
     try:
+        span = _filled_box_span(image_bgr, row)
+        if span is None:
+            # No filled box: blank field (or a row without a box list
+            # falls through to the whole-row read below).
+            if row.boxes:
+                return ""
+        else:
+            first, last = span
+            row = replace(
+                row,
+                x1=row.boxes[first][0],
+                x2=row.boxes[last][0] + row.boxes[last][2])
         _raw, pad = _row_strip_images(image_bgr, row, ocr_engine)
         if pad is None:
             return ""
@@ -400,10 +520,18 @@ def extract_identity_dynamic(image_bgr: np.ndarray,
     ht_clean = re.sub(r"[^A-Za-z0-9]", "", ht_text).upper()
     name_clean = re.sub(r"[^A-Za-z ]", " ", name_text).upper()
     name_clean = " ".join(name_clean.split())
-    if exam_prefix and ht_clean and len(ht_clean) >= 5:
-        # If the strip lost its leading letters, the exam prefix is
-        # the same correction the fixed code already applies.
-        pass
+    if ht_clean:
+        # Fix look-alike misreads (0/O, 5/S, J/1) against the exam
+        # prefix when one is known — a mismatched prefix is ignored.
+        # The filled-box count is the true character count (one
+        # character per box); it exposes a merged character.
+        ht_expected_len = None
+        if ht_row is not None:
+            span = _filled_box_span(image_bgr, ht_row)
+            if span is not None:
+                ht_expected_len = span[1] - span[0] + 1
+        ht_clean = correct_hall_ticket(ht_clean, prefix=exam_prefix,
+                                       expected_len=ht_expected_len)
 
     conf = 0.0
     if ht_clean:
@@ -711,7 +839,8 @@ class DynamicSheet:
 
 def analyze_sheet_dynamic(image_bgr: np.ndarray,
                           expected_questions: Optional[int] = None,
-                          ocr_engine=None) -> DynamicSheet:
+                          ocr_engine=None,
+                          exam_prefix: Optional[str] = None) -> DynamicSheet:
     """Full dynamic pass over one (already straightened) sheet image.
 
     1. Identity from label-anchored box rows.
@@ -720,9 +849,12 @@ def analyze_sheet_dynamic(image_bgr: np.ndarray,
        column, then the next column to the right) — the standard
        OMR order on the Syam sheets — and checked against the
        key-PDF count when one is given.
+    exam_prefix, when known (roster / batch / user-supplied), is
+    used only to fix look-alike misreads in the hall ticket.
     """
     warnings: List[str] = []
-    identity = extract_identity_dynamic(image_bgr, ocr_engine=ocr_engine)
+    identity = extract_identity_dynamic(image_bgr, ocr_engine=ocr_engine,
+                                        exam_prefix=exam_prefix)
 
     start_y = _answers_start_y(image_bgr, ocr_engine=ocr_engine)
     columns = _find_answer_columns(image_bgr, search_y1=start_y)
