@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QProgressBar, QTableWidget,
     QTableWidgetItem, QFileDialog, QTabWidget, QSplitter, QListWidget,
     QListWidgetItem, QFrame, QScrollArea, QHeaderView, QMessageBox,
-    QDoubleSpinBox, QSpinBox
+    QDoubleSpinBox, QSpinBox, QComboBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QSize, QTimer, QPoint
 from PySide6.QtGui import QFont, QPixmap, QColor, QIcon, QPainter, QPolygon
@@ -102,7 +102,8 @@ class BatchWorkerThread(QThread):
         wrong_mark: float = 0.00,
         unattempted_mark: float = 0.00,
         from_question: int = 1,
-        to_question: Optional[int] = None
+        to_question: Optional[int] = None,
+        reading_mode: str = "auto"
     ):
         super().__init__()
         self.target_folder = target_folder
@@ -114,6 +115,7 @@ class BatchWorkerThread(QThread):
         self.unattempted_mark = unattempted_mark
         self.from_question = from_question
         self.to_question = to_question
+        self.reading_mode = reading_mode
 
     def run(self):
         try:
@@ -130,7 +132,8 @@ class BatchWorkerThread(QThread):
                 wrong_mark=self.wrong_mark,
                 unattempted_mark=self.unattempted_mark,
                 from_question=self.from_question,
-                to_question=self.to_question
+                to_question=self.to_question,
+                reading_mode=self.reading_mode
             )
 
             if isinstance(res, tuple) and len(res) == 3:
@@ -321,6 +324,21 @@ class ClientWindow(QMainWindow):
         btn_browse_out.clicked.connect(self._browse_output_excel)
         grid.addWidget(btn_browse_out, 3, 2)
 
+        # Reading Mode Row — lets the user compare Fixed vs Dynamic
+        # reading on their own sheets before the app is finalised.
+        # Auto = fixed unless the warped top is cut off (old behaviour).
+        grid.addWidget(QLabel("5. Reading Mode:"), 4, 0)
+        self.cmb_reading_mode = QComboBox()
+        self.cmb_reading_mode.addItem("Auto (recommended)", "auto")
+        self.cmb_reading_mode.addItem("Dynamic (find positions from sheet)", "dynamic")
+        self.cmb_reading_mode.addItem("Fixed (fixed template)", "fixed")
+        self.cmb_reading_mode.setToolTip(
+            "Auto: fixed template, dynamic only when the top of the sheet is cut off.\n"
+            "Dynamic: always find the hall ticket, name and bubbles from the sheet itself.\n"
+            "Fixed: always use the fixed template. The Excel output records the mode used per sheet.")
+        self.cmb_reading_mode.setStyleSheet("background-color: #0D1117; color: #FFFFFF; border: 1px solid #30363D; padding: 6px; border-radius: 4px;")
+        grid.addWidget(self.cmb_reading_mode, 4, 1, 1, 2)
+
         # Missing File Banner (shows only when key or roster missing from folder)
         self.banner_missing = QFrame()
         self.banner_missing.setStyleSheet("background-color: #2B1D0E; border: 1px solid #9E6A03; border-radius: 6px; padding: 4px;")
@@ -342,7 +360,7 @@ class ClientWindow(QMainWindow):
         self.btn_banner_action2.clicked.connect(self._browse_roster_file)
         bm_layout.addWidget(self.btn_banner_action2)
 
-        grid.addWidget(self.banner_missing, 4, 0, 1, 3)
+        grid.addWidget(self.banner_missing, 5, 0, 1, 3)
 
         layout.addWidget(inputs_box)
 
@@ -947,7 +965,8 @@ class ClientWindow(QMainWindow):
             wrong_mark=self.spn_wrong.value(),
             unattempted_mark=self.spn_unattempted.value(),
             from_question=self.spn_from_q.value(),
-            to_question=self.spn_to_q.value()
+            to_question=self.spn_to_q.value(),
+            reading_mode=self.cmb_reading_mode.currentData() or "auto"
         )
         self.worker.progress.connect(self._on_worker_progress)
         self.worker.finished.connect(self._on_worker_finished)
