@@ -18,6 +18,10 @@ Features:
 Usage:
     python extract_identities_to_excel.py "C:\\path\\to\\folder"
     python extract_identities_to_excel.py "C:\\path\\to\\folder" --key "C:\\path\\to\\key.pdf"
+    python extract_identities_to_excel.py "C:\\path\\to\\folder" --mode dynamic
+        --mode auto (default): dynamic only when the warped top is cut off
+        --mode dynamic: always try dynamic first, fall back to fixed
+        --mode fixed: never use dynamic
 """
 
 import os
@@ -387,6 +391,7 @@ def export_results_to_excel(
             "File Name",
             "Hall Ticket / Name",
             "Identification Type",
+            "Reading Mode",
             "Total Marks",
             "Correct",
             "Correct Marks",
@@ -406,6 +411,7 @@ def export_results_to_excel(
             "File Name",
             "Hall Ticket / Name",
             "Identification Type",
+            "Reading Mode",
             "Confidence %",
             "Status"
         ]
@@ -507,8 +513,25 @@ def process_folder(
     wrong_mark: float = 0.00,
     unattempted_mark: float = 0.00,
     from_question: int = 1,
-    to_question: Optional[int] = None
+    to_question: Optional[int] = None,
+    reading_mode: str = "auto"
 ):
+    """Reading modes (see the app's Reading Mode toggle):
+    - "auto": dynamic only when the warped top is cut off, fixed
+      otherwise (the behaviour before the toggle existed).
+    - "dynamic": always try dynamic first (warped image when the top
+      is intact, deskewed copy when it is cut off); fall back to
+      fixed when dynamic finds nothing usable.
+    - "fixed": never use dynamic; fixed reader + fixed template.
+    The mode actually used for each sheet is recorded in the
+    "Reading Mode" column of the Excel output.
+    """
+    mode = (reading_mode or "auto").strip().lower()
+    if mode not in ("auto", "dynamic", "fixed"):
+        mode = "auto"
+    mode_label = {"auto": "Auto", "dynamic": "Dynamic",
+                  "fixed": "Fixed"}[mode]
+
     target_folder = Path(target_folder).resolve()
     if not target_folder.exists() or not target_folder.is_dir():
         err_msg = f"Target directory does not exist: {target_folder}"
@@ -667,6 +690,7 @@ def process_folder(
         print(f"Exam Prefix          : {active_prefix} ({prefix_source})")
     else:
         print(f"Exam Prefix          : {prefix_source}")
+    print(f"Reading Mode         : {mode_label}")
 
     if roster_records:
         print(f"Student Roster File  : {roster_path.name} ({len(roster_records)} Candidates Loaded - 99%+ Match Mode)")
@@ -697,6 +721,7 @@ def process_folder(
                     "File Name": fpath.name,
                     "Hall Ticket / Name": "UNREADABLE IMAGE",
                     "Identification Type": "ERROR",
+                    "Reading Mode": mode_label,
                     "Confidence %": 0.0,
                     "Status": "FAILED"
                 }
@@ -718,27 +743,37 @@ def process_folder(
             aligned, angle = Preprocessor.align_and_deskew(img)
             is_200q = (len(left_marks) >= 53 or len(right_marks) >= 53)
 
-            # Dynamic path when the warped top is cut off (200Q Syam
-            # sheet): the hall-ticket row maps above y=0, so the fixed
-            # reader below crops the Instructions box instead of the
-            # hall-ticket boxes — that is the wrong ht/name crop this
-            # script used to save. Same selection rule as
-            # EvaluationService: a box row touching the top edge of the
-            # warped image means the top is cut off, so read the
-            # deskewed-only copy (whole page in frame) with dynamic
-            # detection instead. When the top is intact, the fixed
-            # reader below runs exactly as before.
+            # Dynamic path selection (Reading Mode toggle):
+            # - auto: dynamic only when the warped top is cut off
+            #   (200Q Syam sheet): the hall-ticket row maps above
+            #   y=0, so the fixed reader below crops the Instructions
+            #   box instead of the hall-ticket boxes. A box row
+            #   touching the top edge of the warped image means the
+            #   top is cut off, so read the deskewed-only copy
+            #   (whole page in frame) with dynamic detection instead.
+            #   When the top is intact, the fixed reader below runs
+            #   exactly as before.
+            # - dynamic: always try dynamic first — on the warped
+            #   image when the top is intact, on the deskewed copy
+            #   when it is cut off. Falls back to fixed below when
+            #   dynamic finds nothing usable.
+            # - fixed: never use dynamic.
             dyn = None
             use_dynamic = False
+            dyn_image = aligned
             try:
                 from app.omr.dynamic import (
                     analyze_sheet_dynamic, dynamic_rows_to_detected,
                     identity_crops, top_is_cut_off,
                 )
-                if top_is_cut_off(aligned):
-                    deskewed = Preprocessor.deskew_only(img)[0]
+                top_cut = top_is_cut_off(aligned)
+                want_dynamic = (mode == "dynamic"
+                                or (mode == "auto" and top_cut))
+                if want_dynamic:
+                    if top_cut:
+                        dyn_image = Preprocessor.deskew_only(img)[0]
                     dyn = analyze_sheet_dynamic(
-                        deskewed, expected_questions=num_questions,
+                        dyn_image, expected_questions=num_questions,
                         ocr_engine=engine,
                         exam_prefix=active_prefix or None)
                     use_dynamic = (dyn.method == "dynamic"
@@ -766,7 +801,7 @@ def process_folder(
                             name = r_name
                     except Exception:
                         pass
-                crops = identity_crops(deskewed, dyn.identity, engine)
+                crops = identity_crops(dyn_image, dyn.identity, engine)
                 if not ht and not name:
                     # Dynamic found nothing usable: fall back to the
                     # fixed reader below.
@@ -863,6 +898,7 @@ def process_folder(
                 "Candidate Name": name if name else "",
                 "_detected_name": name if name else "",
                 "Identification Type": id_type,
+                "Reading Mode": "Dynamic" if use_dynamic else "Fixed",
                 "Confidence %": round(conf, 4),
                 "Status": status,
                 "_detected_results": detected_results,
@@ -894,6 +930,7 @@ def process_folder(
                 "File Name": fpath.name,
                 "Hall Ticket / Name": "ERROR",
                 "Identification Type": "EXCEPTION",
+                "Reading Mode": mode_label,
                 "Confidence %": 0.0,
                 "Status": f"ERROR: {str(e)}",
                 "_detected_results": {},
@@ -968,6 +1005,7 @@ if __name__ == "__main__":
     unatt_arg = 0.00
     from_q_arg = 1
     to_q_arg = None
+    mode_arg = "auto"
 
     args = sys.argv[1:]
     i = 0
@@ -999,6 +1037,9 @@ if __name__ == "__main__":
         elif args[i] in ("--to-q", "--to") and i + 1 < len(args):
             to_q_arg = int(args[i + 1])
             i += 2
+        elif args[i] in ("--mode", "-m") and i + 1 < len(args):
+            mode_arg = args[i + 1]
+            i += 2
         elif target_arg is None:
             target_arg = args[i]
             i += 1
@@ -1020,5 +1061,6 @@ if __name__ == "__main__":
         wrong_mark=wrong_arg,
         unattempted_mark=unatt_arg,
         from_question=from_q_arg,
-        to_question=to_q_arg
+        to_question=to_q_arg,
+        reading_mode=mode_arg
     )
