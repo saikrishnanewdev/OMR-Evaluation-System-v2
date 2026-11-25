@@ -61,8 +61,13 @@ def test_missing_cluster_falls_back_to_grid():
     missing = rows[:10] + rows[11:]  # row 10 has no candidates
     got = _row_centres_from_candidates(_cands(missing), 40, grid)
     assert len(got) == 40
-    # Row 10 keeps the grid value; its neighbours use the clusters.
-    assert abs(got[10] - grid[10]) < 1e-6
+    # Row 10 takes the fitted value — the grid corrected by the
+    # clusters' offset (grid + 3 here), not the stale grid value.
+    # The stale grid value is what broke the 150Q sheet 388765: its
+    # grid sat half a pitch off the real rows, so the missing row
+    # kept a value in the gap between two real rows and every row
+    # below it shifted by one.
+    assert abs(got[10] - rows[10]) <= 2.0
     assert abs(got[9] - rows[9]) <= 2.0
     assert abs(got[11] - rows[11]) <= 2.0
 
