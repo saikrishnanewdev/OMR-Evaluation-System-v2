@@ -31,7 +31,7 @@ import sys
 import io
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 if sys.platform == "win32":
     if sys.stdout is not None and hasattr(sys.stdout, "buffer"):
@@ -187,27 +187,130 @@ def load_roster(path: Path) -> List[Dict[str, str]]:
             except Exception:
                 df = pd.read_excel(path, engine='openpyxl')
 
-        # Detect roll and name columns
+        # Detect roll and name columns. A daily-test (20Q) roster
+        # has no hall ticket: it has 'B No' (batch) and 'ID No'
+        # columns instead, kept as 'bno' / 'idno' on the record.
         roll_col = None
         name_col = None
+        bno_col = None
+        idno_col = None
         for col in df.columns:
             c_l = str(col).lower()
             if not roll_col and any(k in c_l for k in ('roll', 'hall', 'ht', 'seat', 'ticket', 'reg')):
                 roll_col = col
             if not name_col and any(k in c_l for k in ('name', 'candidate', 'student')):
                 name_col = col
+            if not bno_col and 'b no' in c_l:
+                bno_col = col
+            if not idno_col and 'id no' in c_l:
+                idno_col = col
 
         for _, row in df.iterrows():
             r_val = str(row[roll_col]).strip() if roll_col and pd.notna(row[roll_col]) else ""
             n_val = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else ""
+            rec = {'roll': r_val, 'name': n_val}
+            if bno_col is not None and pd.notna(row[bno_col]):
+                rec['bno'] = _roster_cell_str(row[bno_col])
+            if idno_col is not None and pd.notna(row[idno_col]):
+                # The ID No is written in 3 boxes on the sheet, so a
+                # numeric cell (011 stored as 11.0) is zero-padded
+                # back to 3 digits.
+                rec['idno'] = _roster_cell_str(row[idno_col], pad_digits=3)
             if r_val or n_val:
-                records.append({'roll': r_val, 'name': n_val})
+                records.append(rec)
         if records:
             return records
     except Exception as e:
         print(f"[WARNING] Could not parse roster from {path.name}: {e}")
 
     return records
+
+
+def _roster_cell_str(value, pad_digits: int = 0) -> str:
+    """A roster cell as a clean string. Pandas reads a numeric cell
+    (011) as the float 11.0, so '11.0' is collapsed back to '11';
+    pad_digits zero-pads a short all-digit value (the 3-box ID No:
+    '11' -> '011'). Non-numeric values pass through unchanged."""
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if pad_digits and text.isdigit() and len(text) < pad_digits:
+        text = text.zfill(pad_digits)
+    return text
+
+
+def _best_name_only_match(cand_name: str,
+                           roster: List[Dict[str, str]]) -> Tuple[Optional[str], Optional[str]]:
+    """Last-resort name-only roster match, below the reconciler's
+    0.65 bar. Returns the best record's (roll, name) when its
+    no-space name similarity is >= 0.60 AND it beats the second-best
+    record by more than 0.05 — a clear winner, not a coin flip.
+    PRIYA's name reads 'PRHNA' (0.60 vs PRIYA, 0.50 vs SUPRIYA),
+    which the reconciler rejects but this accepts. Returns
+    (None, None) when no record is a clear winner.
+    """
+    from difflib import SequenceMatcher
+
+    def _sim(a: str, b: str) -> float:
+        a = re.sub(r"\s+", "", str(a or "").upper())
+        b = re.sub(r"\s+", "", str(b or "").upper())
+        if not a or not b:
+            return 0.0
+        return SequenceMatcher(None, a, b).ratio()
+
+    scored = []
+    for rec in roster:
+        r_roll = str(rec.get("roll", "") or "").strip()
+        r_name = str(rec.get("name", "") or "").strip()
+        if r_name:
+            scored.append((_sim(cand_name, r_name), r_roll, r_name))
+    if not scored:
+        return (None, None)
+    scored.sort(key=lambda s: s[0], reverse=True)
+    best_score, best_roll, best_name = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    if best_score >= 0.60 and best_score - second > 0.05:
+        return (best_roll, best_name)
+    return (None, None)
+
+
+def match_daily_test(cand_bno: str, cand_idno: str, cand_name: str,
+                     roster: List[Dict[str, str]]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Match a daily-test (20Q) read against a B No / ID No roster.
+
+    Scores each roster record on the three signals the sheet gives:
+    B No (batch) 0.40, ID No 0.30, name 0.30 (no-space similarity).
+    The best record wins when its score is >= 0.65. The ID No read
+    is often partial (thin handwritten '1's are missed), so the B
+    No and name carry the match; a wrong B No alone cannot win
+    because it is only 0.40 of the score. Returns (bno, idno, name)
+    of the winning roster record, or (None, None, None).
+    """
+    from difflib import SequenceMatcher
+
+    def _sim(a: str, b: str) -> float:
+        a = re.sub(r"\s+", "", str(a or "").upper())
+        b = re.sub(r"\s+", "", str(b or "").upper())
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        return SequenceMatcher(None, a, b).ratio()
+
+    best = None
+    best_score = 0.0
+    for rec in roster:
+        r_bno = str(rec.get("bno", "") or "").strip()
+        r_idno = str(rec.get("idno", "") or "").strip()
+        r_name = str(rec.get("name", "") or "").strip()
+        if not (r_bno or r_idno or r_name):
+            continue
+        score = 0.40 * _sim(cand_bno, r_bno) + 0.30 * _sim(cand_idno, r_idno) + 0.30 * _sim(cand_name, r_name)
+        if score > best_score:
+            best_score, best = score, (r_bno, r_idno, r_name)
+    if best is not None and best_score >= 0.65:
+        return best
+    return (None, None, None)
 
 
 def infer_prefix_from_roster(roster_records: List[Dict[str, str]]) -> Optional[str]:
@@ -392,6 +495,9 @@ def export_results_to_excel(
             "Rank",
             "File Name",
             "Hall Ticket / Name",
+            "B No",
+            "ID No",
+            "Candidate Name",
             "Identification Type",
             "Reading Mode",
             "Total Marks",
@@ -412,6 +518,9 @@ def export_results_to_excel(
             "S.No",
             "File Name",
             "Hall Ticket / Name",
+            "B No",
+            "ID No",
+            "Candidate Name",
             "Identification Type",
             "Reading Mode",
             "Confidence %",
@@ -770,7 +879,7 @@ def process_folder(
             try:
                 from app.omr.dynamic import (
                     analyze_sheet_dynamic, dynamic_rows_to_detected,
-                    identity_crops, top_is_cut_off,
+                    extract_identity_20q, identity_crops, top_is_cut_off,
                 )
                 top_cut = top_is_cut_off(aligned)
                 no_fixed_template = num_questions not in (160, 200)
@@ -778,7 +887,14 @@ def process_folder(
                                 or (mode == "auto"
                                     and (top_cut or no_fixed_template)))
                 if want_dynamic:
-                    if top_cut:
+                    # No timing track on the raw sheet (the 20Q strip
+                    # and the 50Q photo have no timing marks at all):
+                    # the warp to the 160Q reference points distorts
+                    # them, so read the deskewed-only copy instead
+                    # (original size, rotation only).
+                    no_track = (len(left_marks) < 2
+                                and len(right_marks) < 2)
+                    if top_cut or no_track:
                         dyn_image = Preprocessor.deskew_only(img)[0]
                     dyn = analyze_sheet_dynamic(
                         dyn_image, expected_questions=num_questions,
@@ -791,39 +907,121 @@ def process_folder(
                 use_dynamic = False
 
             # 2. Extract Student Identity (HT / Name)
+            b_no = ""
+            id_no = ""
             if use_dynamic:
                 ht = dyn.identity.hall_ticket or ""
                 name = dyn.identity.name or ""
                 conf = dyn.identity.confidence
                 valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
                 crops = identity_crops(dyn_image, dyn.identity, engine)
-                # Both readers vote: the fixed reader runs on the same
-                # sheet, and when the two readings disagree the roster
-                # decides (348819: dynamic read 'KKD2025K7300694',
-                # fixed read 'KKD2025KTS00627'; the roster picks the
-                # fixed reading, 'KKD2025KTS01627'). Without a roster,
-                # or when neither reading matches a roster student, the
-                # dynamic reading stands.
-                try:
-                    f_ht, f_name, f_conf, _f_valid, f_crops = engine.extract_identity(
-                        aligned, exam_prefix=active_prefix, roster=None,
-                        return_crops=True, is_200q=is_200q)
-                    v_ht, v_name, v_source = engine.resolve_identity_vote(
-                        ht, name, f_ht, f_name,
-                        roster=roster_records or None,
-                        preferred_prefix=active_prefix)
-                    if v_source == "fixed":
-                        ht, name, conf, valid, crops = (
-                            v_ht, v_name, f_conf,
-                            bool(v_ht and re.match(r"^[A-Z0-9]{4,20}$", v_ht)),
-                            f_crops)
-                    else:
-                        ht, name = v_ht, v_name
-                        valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
-                except Exception:
-                    # The vote must never break a working dynamic read.
-                    pass
-                if not ht and not name:
+                # Daily-test (20Q) strip: no hall-ticket box row — the
+                # identity is B No / ID No / name from the small table
+                # at the top right. The fixed reader cannot read it
+                # (its 160Q/200Q strips land on the wrong place), so
+                # the 20Q reader + roster match replaces the vote.
+                is_daily = bool(roster_records) and any(
+                    "bno" in r for r in roster_records)
+                if not is_daily and not ht and not name and num_questions is not None and num_questions <= 25:
+                    is_daily = True
+                if is_daily:
+                    try:
+                        daily = extract_identity_20q(dyn_image, engine)
+                        matched = (None, None, None)
+                        if roster_records:
+                            for b_cand in daily.b_no_candidates or [""]:
+                                for i_cand in daily.id_no_candidates or [""]:
+                                    for n_cand in daily.name_candidates or [daily.name]:
+                                        matched = match_daily_test(
+                                            b_cand, i_cand, n_cand, roster_records)
+                                        if matched[0] or matched[2]:
+                                            break
+                                    if matched[0] or matched[2]:
+                                        break
+                                if matched[0] or matched[2]:
+                                    break
+                        if matched[0] or matched[2]:
+                            b_no, id_no, name = matched
+                            ht = ""
+                            conf = 0.9
+                            valid = True
+                        else:
+                            # No roster match: keep the best raw read.
+                            b_no = daily.b_no or ""
+                            id_no = daily.id_no or ""
+                            name = daily.name or ""
+                            conf = 0.7 if (b_no or id_no or name) else 0.0
+                            valid = bool(b_no or id_no or name)
+                    except Exception:
+                        pass
+                if not b_no and not id_no:
+                    # Both readers vote: the fixed reader runs on the same
+                    # sheet, and when the two readings disagree the roster
+                    # decides (348819: dynamic read 'KKD2025K7300694',
+                    # fixed read 'KKD2025KTS00627'; the roster picks the
+                    # fixed reading, 'KKD2025KTS01627'). Without a roster,
+                    # or when neither reading matches a roster student, the
+                    # dynamic reading stands.
+                    try:
+                        f_ht, f_name, f_conf, _f_valid, f_crops = engine.extract_identity(
+                            aligned, exam_prefix=active_prefix, roster=None,
+                            return_crops=True, is_200q=is_200q)
+                        v_ht, v_name, v_source = engine.resolve_identity_vote(
+                            ht, name, f_ht, f_name,
+                            roster=roster_records or None,
+                            preferred_prefix=active_prefix)
+                        if v_source == "fixed":
+                            ht, name, conf, valid, crops = (
+                                v_ht, v_name, f_conf,
+                                bool(v_ht and re.match(r"^[A-Z0-9]{4,20}$", v_ht)),
+                                f_crops)
+                        else:
+                            ht, name = v_ht, v_name
+                            valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                    except Exception:
+                        # The vote must never break a working dynamic read.
+                        pass
+                    # Alternate name readings: when the primary name did
+                    # not reconcile to a roster student, try the other
+                    # cleanings of the same strip (ink-binary reads
+                    # PRIYA's name as 'PRIVA', 0.8 similar, where the
+                    # red-drop 'PRHNA' scores only 0.6 and fails).
+                    # Each candidate is tried with the hall ticket and
+                    # without it: a garbled HT with digits (SUPRIYA's
+                    # 'SUTTATRS440') poisons the dual-signal match, so
+                    # the name-only path is the fallback that resolves
+                    # her ('SOPRIA' -> T11-490) and VENKATARAMANA.
+                    if (roster_records and dyn.identity.name_candidates):
+                        try:
+                            r_ht, _r_name = engine._reconcile_with_roster(
+                                ht, name, ht, roster_records)
+                            if not r_ht:
+                                found = False
+                                for cand in dyn.identity.name_candidates:
+                                    for try_ht in (ht, ""):
+                                        r_ht2, r_name2 = engine._reconcile_with_roster(
+                                            try_ht, cand, try_ht, roster_records)
+                                        if r_ht2:
+                                            ht, name = r_ht2, r_name2
+                                            valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                                            found = True
+                                            break
+                                    if found:
+                                        break
+                                if not found:
+                                    # Last resort: a clear-winner
+                                    # name-only match below the
+                                    # reconciler's bar (PRIYA).
+                                    for cand in dyn.identity.name_candidates:
+                                        r_ht3, r_name3 = _best_name_only_match(
+                                            cand, roster_records)
+                                        if r_ht3:
+                                            ht, name = r_ht3, r_name3
+                                            valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                                            break
+                        except Exception:
+                            pass
+                if not ht and not name and not b_no and not id_no:
                     # Dynamic found nothing usable: fall back to the
                     # fixed reader below.
                     use_dynamic = False
@@ -878,7 +1076,17 @@ def process_folder(
             # 4. Determine Display Identity and Status
             ht_missing_on_sheet = crops.get("ht_missing_on_sheet", False)
 
-            if ht:
+            if b_no or id_no:
+                # Daily-test (20Q) strip: the identity is B No / ID
+                # No / name — there is no hall ticket to miss.
+                identity_val = name if name else "(BLANK / UNREADABLE)"
+                id_type = "B NO / ID NO"
+                if name and (b_no or id_no):
+                    status = "SUCCESS"
+                else:
+                    status = "REVIEW_REQUIRED (Missing B No / ID No)"
+                disp_msg = f"B No: {b_no or '-'} ID No: {id_no or '-'} Name: {identity_val} ({conf*100:.1f}%)"
+            elif ht:
                 if ht_missing_on_sheet:
                     # Rule 2: Assigned by Candidate Name match against Roster
                     identity_val = ht
@@ -917,6 +1125,8 @@ def process_folder(
             record = {
                 "File Name": fpath.name,
                 "Hall Ticket / Name": identity_val,
+                "B No": b_no,
+                "ID No": id_no,
                 "Candidate Name": name if name else "",
                 "_detected_name": name if name else "",
                 "Identification Type": id_type,
