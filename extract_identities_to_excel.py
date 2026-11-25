@@ -788,20 +788,33 @@ def process_folder(
                 name = dyn.identity.name or ""
                 conf = dyn.identity.confidence
                 valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
-                # Roster reconciliation, same as the fixed reader does
-                # when a roster is present in the folder.
-                if roster_records and (ht or name):
-                    try:
-                        r_ht, r_name = engine._reconcile_with_roster(
-                            ht, name, ht, roster_records,
-                            preferred_prefix=active_prefix)
-                        if r_ht:
-                            ht = r_ht
-                        if r_name:
-                            name = r_name
-                    except Exception:
-                        pass
                 crops = identity_crops(dyn_image, dyn.identity, engine)
+                # Both readers vote: the fixed reader runs on the same
+                # sheet, and when the two readings disagree the roster
+                # decides (348819: dynamic read 'KKD2025K7300694',
+                # fixed read 'KKD2025KTS00627'; the roster picks the
+                # fixed reading, 'KKD2025KTS01627'). Without a roster,
+                # or when neither reading matches a roster student, the
+                # dynamic reading stands.
+                try:
+                    f_ht, f_name, f_conf, _f_valid, f_crops = engine.extract_identity(
+                        aligned, exam_prefix=active_prefix, roster=None,
+                        return_crops=True, is_200q=is_200q)
+                    v_ht, v_name, v_source = engine.resolve_identity_vote(
+                        ht, name, f_ht, f_name,
+                        roster=roster_records or None,
+                        preferred_prefix=active_prefix)
+                    if v_source == "fixed":
+                        ht, name, conf, valid, crops = (
+                            v_ht, v_name, f_conf,
+                            bool(v_ht and re.match(r"^[A-Z0-9]{4,20}$", v_ht)),
+                            f_crops)
+                    else:
+                        ht, name = v_ht, v_name
+                        valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                except Exception:
+                    # The vote must never break a working dynamic read.
+                    pass
                 if not ht and not name:
                     # Dynamic found nothing usable: fall back to the
                     # fixed reader below.
