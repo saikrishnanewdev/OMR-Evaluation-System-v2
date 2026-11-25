@@ -714,7 +714,13 @@ class OCREngine:
         c_parts = clean_name.split()
         name_nospace = re.sub(r'\s+', '', clean_name)
 
-        has_cand_ht = bool(cand_ht_upper and cand_ht_upper != "00000")
+        # A hall ticket always has digits. A candidate with no digit
+        # at all (a garbled read like 'TAL' from the 50Q grand-test
+        # sheet) counts as absent: it must not poison a good name
+        # match through the dual-signal combination below. With no
+        # usable HT the name-only path runs instead.
+        has_cand_ht = bool(cand_ht_upper and cand_ht_upper != "00000"
+                           and any(c.isdigit() for c in cand_ht_upper))
         has_cand_name = bool(len(clean_name) >= 3)
 
         # Extract district prefix for scoped search partitioning (Pillar 2)
