@@ -18,12 +18,12 @@ Features:
 Usage:
     python extract_identities_to_excel.py "C:\\path\\to\\folder"
     python extract_identities_to_excel.py "C:\\path\\to\\folder" --key "C:\\path\\to\\key.pdf"
-    python extract_identities_to_excel.py "C:\\path\\to\\folder" --mode dynamic
-        --mode auto (default): dynamic when the warped top is cut off,
-            or when no fixed template exists for the question count
-            (templates cover exactly 160Q and 200Q)
-        --mode dynamic: always try dynamic first, fall back to fixed
-        --mode fixed: never use dynamic
+
+Everything is read dynamically from each sheet: the hall-ticket and
+name rows are found from the printed labels, and the answer bubbles
+are found from the pink answer columns below ANSWERS. There is no
+fixed layout and no reading mode to choose — the question count comes
+from the answer-key PDF.
 """
 
 import os
@@ -46,7 +46,6 @@ if sys.platform == "win32":
             pass
 
 import cv2
-import unicodedata
 import re
 from collections import Counter
 import numpy as np
@@ -56,8 +55,6 @@ from openpyxl.utils import get_column_letter
 
 from app.omr.preprocessor import Preprocessor
 from app.ocr.engine import OCREngine
-from app.omr.bubble_detector import BubbleDetector
-from app.omr.template import get_template, template_160, template_200
 from app.evaluation.answer_key import AnswerKeyExtractor
 from app.evaluation.scoring_engine import ScoringEngine
 
@@ -342,6 +339,11 @@ def detect_batch_prefix(image_files: List[Path], engine: OCREngine, sample_limit
     """
     Dynamically infers the shared exam prefix from the scanned sheets in the folder,
     without any hardcoded exam codes. If no shared prefix is detected, returns None.
+
+    Reads each sample sheet with the same dynamic identity reader the
+    batch run uses and takes the letter prefix of the hall ticket it
+    reads (the part before the roll digits). At least two sheets must
+    agree — a single misread must not set the prefix for the batch.
     """
     prefixes = []
     for fpath in image_files[:sample_limit]:
@@ -349,57 +351,37 @@ def detect_batch_prefix(image_files: List[Path], engine: OCREngine, sample_limit
             img = cv2.imread(str(fpath))
             if img is None:
                 continue
-            aligned, angle = Preprocessor.align_and_deskew(img)
-
-            left_marks, right_marks, _ = Preprocessor.detect_timing_tracks(aligned)
-            is_200q = (len(left_marks) >= 53 or len(right_marks) >= 53)
-
-            if is_200q:
-                ht_raw = aligned[175:222, 515:1115]
-            else:
-                ht_raw = aligned[218:260, 410:1075]
-            z_ht = cv2.resize(ht_raw, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-            cl_ht = engine.remove_red_color(z_ht)
-            h_h, w_h = cl_ht.shape[:2]
-            scaled_h = cv2.resize(cl_ht, (int(w_h * 48.0 / h_h), 48), interpolation=cv2.INTER_AREA)
-            pad_h = cv2.copyMakeBorder(scaled_h, 12, 12, 25, 25, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-            preds_ht, _ = engine.ocr.text_recognizer([pad_h])
-            raw_ht = preds_ht[0][0] if preds_ht else ''
-            norm = unicodedata.normalize('NFKC', raw_ht)
-            clean = re.sub(r'[^A-Za-z0-9]', '', norm).upper()
-
-            # Disambiguate any trailing letters that follow digits at the end
-            disambiguated_chars = list(clean)
-            for i in range(len(disambiguated_chars) - 1, -1, -1):
-                c = disambiguated_chars[i]
-                if c.isdigit():
-                    break
-                elif c in engine.CHAR_TO_DIGIT:
-                    disambiguated_chars[i] = engine.CHAR_TO_DIGIT[c]
-                else:
-                    break
-            clean_fixed = "".join(disambiguated_chars)
-
-            m = re.match(r'^([A-Z0-9]*?[A-Z])\d{3,5}$', clean_fixed)
+            aligned, _angle = Preprocessor.align_and_deskew(img)
+            from app.omr.dynamic import extract_identity_dynamic, top_is_cut_off
+            dyn_image = aligned
+            if top_is_cut_off(aligned):
+                dyn_image = Preprocessor.deskew_only(img)[0]
+            ident = extract_identity_dynamic(dyn_image, ocr_engine=engine)
+            ht = ident.hall_ticket or ""
+            m = re.match(r'^([A-Z0-9]*?[A-Z])\d{3,5}$', ht)
             if m:
-                p = m.group(1)
-            elif len(clean_fixed) >= 14:
-                p = clean_fixed[:10 if is_200q else 11]
-            else:
-                p = None
-
-            if p:
-                if is_200q:
-                    p = re.sub(r'K[7T][358S]$', 'KTS', p)
-                prefixes.append(p)
+                prefixes.append(m.group(1))
         except Exception:
             continue
 
     if prefixes:
-        counts = Counter(prefixes)
-        most_common, cnt = counts.most_common(1)[0]
-        if cnt >= 2:
-            return most_common
+        # Prefixes from different sheets can differ by a fused
+        # character: one sheet reads 'AP05C' (handwritten J + 1
+        # fused into a single '1') while another reads the full
+        # 'AP05CJ'. They are compatible when one is a string-prefix
+        # of the other, so group by that and take the longest prefix
+        # of the largest compatible group. At least two sheets must
+        # agree — a single misread must not set the prefix.
+        uniq = sorted(set(prefixes), key=len, reverse=True)
+        best_prefix = None
+        best_count = 0
+        for cand in uniq:
+            group = [p for p in prefixes
+                     if p.startswith(cand) or cand.startswith(p)]
+            if len(group) > best_count:
+                best_prefix, best_count = cand, len(group)
+        if best_count >= 2 and best_prefix:
+            return best_prefix
     return None
 
 
@@ -499,7 +481,6 @@ def export_results_to_excel(
             "ID No",
             "Candidate Name",
             "Identification Type",
-            "Reading Mode",
             "Total Marks",
             "Correct",
             "Correct Marks",
@@ -522,7 +503,6 @@ def export_results_to_excel(
             "ID No",
             "Candidate Name",
             "Identification Type",
-            "Reading Mode",
             "Confidence %",
             "Status"
         ]
@@ -624,25 +604,16 @@ def process_folder(
     wrong_mark: float = 0.00,
     unattempted_mark: float = 0.00,
     from_question: int = 1,
-    to_question: Optional[int] = None,
-    reading_mode: str = "auto"
+    to_question: Optional[int] = None
 ):
-    """Reading modes (see the app's Reading Mode toggle):
-    - "auto": dynamic only when the warped top is cut off, fixed
-      otherwise (the behaviour before the toggle existed).
-    - "dynamic": always try dynamic first (warped image when the top
-      is intact, deskewed copy when it is cut off); fall back to
-      fixed when dynamic finds nothing usable.
-    - "fixed": never use dynamic; fixed reader + fixed template.
-    The mode actually used for each sheet is recorded in the
-    "Reading Mode" column of the Excel output.
-    """
-    mode = (reading_mode or "auto").strip().lower()
-    if mode not in ("auto", "dynamic", "fixed"):
-        mode = "auto"
-    mode_label = {"auto": "Auto", "dynamic": "Dynamic",
-                  "fixed": "Fixed"}[mode]
+    """Batch-evaluate every scanned OMR sheet in a folder.
 
+    Everything is read dynamically from each sheet: the hall-ticket
+    and name rows are found from the printed labels, and the answer
+    bubbles are found from the pink answer columns below ANSWERS.
+    There is no fixed layout and no reading mode to choose — the
+    question count comes from the answer-key PDF.
+    """
     target_folder = Path(target_folder).resolve()
     if not target_folder.exists() or not target_folder.is_dir():
         err_msg = f"Target directory does not exist: {target_folder}"
@@ -768,8 +739,6 @@ def process_folder(
         except Exception:
             num_questions = 160
 
-    template = get_template(num_questions)
-
     # Dynamic Scoring Configuration:
     if correct_mark is not None:
         active_correct_mark = float(correct_mark)
@@ -783,12 +752,11 @@ def process_folder(
     active_from_q = max(1, from_question)
     active_to_q = min(num_questions, to_question) if to_question else num_questions
 
-    bubble_detector = BubbleDetector(template=template) if has_evaluation else None
     scoring_engine = ScoringEngine(
         correct_mark=active_correct_mark,
         wrong_mark=active_wrong_mark,
         unattempted_mark=active_unattempted_mark,
-        total_questions=num_questions if num_questions > 0 else template.total_questions,
+        total_questions=num_questions if num_questions > 0 else 160,
         from_question=active_from_q,
         to_question=active_to_q
     ) if has_evaluation else None
@@ -801,7 +769,6 @@ def process_folder(
         print(f"Exam Prefix          : {active_prefix} ({prefix_source})")
     else:
         print(f"Exam Prefix          : {prefix_source}")
-    print(f"Reading Mode         : {mode_label}")
 
     if roster_records:
         print(f"Student Roster File  : {roster_path.name} ({len(roster_records)} Candidates Loaded - 99%+ Match Mode)")
@@ -811,7 +778,7 @@ def process_folder(
     if has_evaluation:
         print(f"Answer Key File      : {key_pdf_path.name} ({num_questions} Questions Loaded)")
         print(f"Scoring Scheme       : Correct: {active_correct_mark:+.2f} | Wrong: {active_wrong_mark:+.2f} | Unattempted: {active_unattempted_mark:+.2f}")
-        print(f"Evaluation Scope     : Questions {active_from_q} to {active_to_q} (Template: {template.name})")
+        print(f"Evaluation Scope     : Questions {active_from_q} to {active_to_q}")
         print("Evaluation Mode      : FULL (Identities + OMR Marks + Competition Ranking)")
     else:
         print("Answer Key File      : None Detected (Identity-Only Mode)")
@@ -832,7 +799,6 @@ def process_folder(
                     "File Name": fpath.name,
                     "Hall Ticket / Name": "UNREADABLE IMAGE",
                     "Identification Type": "ERROR",
-                    "Reading Mode": mode_label,
                     "Confidence %": 0.0,
                     "Status": "FAILED"
                 }
@@ -852,27 +818,15 @@ def process_folder(
             # 1. Timing track alignment & deskew
             left_marks, right_marks, angle = Preprocessor.detect_timing_tracks(img)
             aligned, angle = Preprocessor.align_and_deskew(img)
-            is_200q = (len(left_marks) >= 53 or len(right_marks) >= 53)
 
-            # Dynamic path selection (Reading Mode toggle):
-            # - auto: dynamic only when the warped top is cut off
-            #   (200Q Syam sheet): the hall-ticket row maps above
-            #   y=0, so the fixed reader below crops the Instructions
-            #   box instead of the hall-ticket boxes. A box row
-            #   touching the top edge of the warped image means the
-            #   top is cut off, so read the deskewed-only copy
-            #   (whole page in frame) with dynamic detection instead.
-            #   When the top is intact, the fixed reader below runs
-            #   exactly as before.
-            #   Auto also uses dynamic when no fixed template exists
-            #   for the question count (templates cover exactly 160Q
-            #   and 200Q): a 150Q sheet run through the fixed reader
-            #   would get the 160Q template and read garbage.
-            # - dynamic: always try dynamic first — on the warped
-            #   image when the top is intact, on the deskewed copy
-            #   when it is cut off. Falls back to fixed below when
-            #   dynamic finds nothing usable.
-            # - fixed: never use dynamic.
+            # 2. Dynamic reading: the answer columns and the identity
+            # rows are found on the sheet itself — no fixed template
+            # is used anywhere. The warped image is the default;
+            # when its top is cut off (a box row touching the top
+            # edge means the hall-ticket row mapped above y=0) or the
+            # sheet has no timing track at all (the 20Q strip and
+            # the 50Q photo), read the deskewed-only copy (whole
+            # page in frame, rotation only) instead.
             dyn = None
             use_dynamic = False
             dyn_image = aligned
@@ -882,31 +836,21 @@ def process_folder(
                     extract_identity_20q, identity_crops, top_is_cut_off,
                 )
                 top_cut = top_is_cut_off(aligned)
-                no_fixed_template = num_questions not in (160, 200)
-                want_dynamic = (mode == "dynamic"
-                                or (mode == "auto"
-                                    and (top_cut or no_fixed_template)))
-                if want_dynamic:
-                    # No timing track on the raw sheet (the 20Q strip
-                    # and the 50Q photo have no timing marks at all):
-                    # the warp to the 160Q reference points distorts
-                    # them, so read the deskewed-only copy instead
-                    # (original size, rotation only).
-                    no_track = (len(left_marks) < 2
-                                and len(right_marks) < 2)
-                    if top_cut or no_track:
-                        dyn_image = Preprocessor.deskew_only(img)[0]
-                    dyn = analyze_sheet_dynamic(
-                        dyn_image, expected_questions=num_questions,
-                        ocr_engine=engine,
-                        exam_prefix=active_prefix or None)
-                    use_dynamic = (dyn.method == "dynamic"
-                                   and dyn.found_questions >= 1)
+                no_track = (len(left_marks) < 2
+                            and len(right_marks) < 2)
+                if top_cut or no_track:
+                    dyn_image = Preprocessor.deskew_only(img)[0]
+                dyn = analyze_sheet_dynamic(
+                    dyn_image, expected_questions=num_questions,
+                    ocr_engine=engine,
+                    exam_prefix=active_prefix or None)
+                use_dynamic = (dyn.method == "dynamic"
+                               and dyn.found_questions >= 1)
             except Exception:
                 dyn = None
                 use_dynamic = False
 
-            # 2. Extract Student Identity (HT / Name)
+            # 3. Extract Student Identity (HT / Name)
             b_no = ""
             id_no = ""
             if use_dynamic:
@@ -917,9 +861,8 @@ def process_folder(
                 crops = identity_crops(dyn_image, dyn.identity, engine)
                 # Daily-test (20Q) strip: no hall-ticket box row — the
                 # identity is B No / ID No / name from the small table
-                # at the top right. The fixed reader cannot read it
-                # (its 160Q/200Q strips land on the wrong place), so
-                # the 20Q reader + roster match replaces the vote.
+                # at the top right, so the 20Q reader + roster match
+                # replaces the vote.
                 is_daily = bool(roster_records) and any(
                     "bno" in r for r in roster_records)
                 if not is_daily and not ht and not name and num_questions is not None and num_questions <= 25:
@@ -955,29 +898,27 @@ def process_folder(
                     except Exception:
                         pass
                 if not b_no and not id_no:
-                    # Both readers vote: the fixed reader runs on the same
-                    # sheet, and when the two readings disagree the roster
-                    # decides (348819: dynamic read 'KKD2025K7300694',
-                    # fixed read 'KKD2025KTS00627'; the roster picks the
-                    # fixed reading, 'KKD2025KTS01627'). Without a roster,
-                    # or when neither reading matches a roster student, the
-                    # dynamic reading stands.
+                    # Two readings of the same hall-ticket row vote:
+                    # the primary read and a second read from a
+                    # taller strip (DynamicIdentity.hall_ticket_alt),
+                    # which catches handwriting dipping below the
+                    # detected row. When they disagree, the roster
+                    # decides (348819: primary 'KKD2025K7300694',
+                    # second 'KKD2025KTS01624'; the roster picks
+                    # 'KKD2025KTS01627'). Without a roster, or when
+                    # neither reading matches a roster student, the
+                    # primary reading stands.
                     try:
-                        f_ht, f_name, f_conf, _f_valid, f_crops = engine.extract_identity(
-                            aligned, exam_prefix=active_prefix, roster=None,
-                            return_crops=True, is_200q=is_200q)
                         v_ht, v_name, v_source = engine.resolve_identity_vote(
-                            ht, name, f_ht, f_name,
+                            ht, name, dyn.identity.hall_ticket_alt,
                             roster=roster_records or None,
                             preferred_prefix=active_prefix)
-                        if v_source == "fixed":
-                            ht, name, conf, valid, crops = (
-                                v_ht, v_name, f_conf,
-                                bool(v_ht and re.match(r"^[A-Z0-9]{4,20}$", v_ht)),
-                                f_crops)
-                        else:
-                            ht, name = v_ht, v_name
-                            valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                        ht, name = v_ht, v_name
+                        valid = bool(ht and re.match(r"^[A-Z0-9]{4,20}$", ht))
+                        if v_source == "second":
+                            # The second reading won via the roster:
+                            # a roster-verified identity.
+                            conf = 0.9
                     except Exception:
                         # The vote must never break a working dynamic read.
                         pass
@@ -1021,14 +962,20 @@ def process_folder(
                                             break
                         except Exception:
                             pass
-                if not ht and not name and not b_no and not id_no:
-                    # Dynamic found nothing usable: fall back to the
-                    # fixed reader below.
-                    use_dynamic = False
             if not use_dynamic:
-                ht, name, conf, valid, crops = engine.extract_identity(
-                    aligned, exam_prefix=active_prefix, roster=roster_records, return_crops=True, is_200q=is_200q
-                )
+                # Dynamic found no answer columns on this sheet: no
+                # identity and no bubbles — the sheet is unreadable.
+                # Everything stays blank (all questions unattempted,
+                # REVIEW_REQUIRED) rather than guessing from a
+                # fixed template.
+                ht = ""
+                name = ""
+                conf = 0.0
+                valid = False
+                blank = np.full((50, 200, 3), 255, dtype=np.uint8)
+                crops = {"ht_processed": blank, "name_processed": blank,
+                         "ht_raw": blank, "name_raw": blank,
+                         "ht_missing_on_sheet": True}
 
             # Save cropped debug images
             ht_crop_file = target_folder / f"{fpath.stem}_ht_processed.png"
@@ -1055,17 +1002,11 @@ def process_folder(
 
             if has_evaluation:
                 if use_dynamic:
-                    # Same dynamic bubble grid as EvaluationService, on
-                    # the deskewed copy — the fixed template misreads
-                    # this sheet badly (69 unattempted on the old run).
                     detected_results = dynamic_rows_to_detected(dyn)
                 else:
-                    ink_map = Preprocessor.extract_ink_channel(aligned)
-                    detected_results = bubble_detector.analyze_sheet(
-                        ink_map,
-                        timing_marks=(left_marks, right_marks),
-                        image_bgr=aligned
-                    )
+                    # Dynamic found no answer columns: no bubbles to
+                    # score, so every question is unattempted.
+                    detected_results = {}
                 _, correct_cnt, wrong_cnt, unattempted_cnt, total_marks, _, _ = scoring_engine.evaluate_sheet(
                     detected_results, answer_key.items
                 )
@@ -1130,7 +1071,6 @@ def process_folder(
                 "Candidate Name": name if name else "",
                 "_detected_name": name if name else "",
                 "Identification Type": id_type,
-                "Reading Mode": "Dynamic" if use_dynamic else "Fixed",
                 "Confidence %": round(conf, 4),
                 "Status": status,
                 "_detected_results": detected_results,
@@ -1162,7 +1102,6 @@ def process_folder(
                 "File Name": fpath.name,
                 "Hall Ticket / Name": "ERROR",
                 "Identification Type": "EXCEPTION",
-                "Reading Mode": mode_label,
                 "Confidence %": 0.0,
                 "Status": f"ERROR: {str(e)}",
                 "_detected_results": {},
@@ -1237,7 +1176,6 @@ if __name__ == "__main__":
     unatt_arg = 0.00
     from_q_arg = 1
     to_q_arg = None
-    mode_arg = "auto"
 
     args = sys.argv[1:]
     i = 0
@@ -1269,9 +1207,6 @@ if __name__ == "__main__":
         elif args[i] in ("--to-q", "--to") and i + 1 < len(args):
             to_q_arg = int(args[i + 1])
             i += 2
-        elif args[i] in ("--mode", "-m") and i + 1 < len(args):
-            mode_arg = args[i + 1]
-            i += 2
         elif target_arg is None:
             target_arg = args[i]
             i += 1
@@ -1293,6 +1228,5 @@ if __name__ == "__main__":
         wrong_mark=wrong_arg,
         unattempted_mark=unatt_arg,
         from_question=from_q_arg,
-        to_question=to_q_arg,
-        reading_mode=mode_arg
+        to_question=to_q_arg
     )
