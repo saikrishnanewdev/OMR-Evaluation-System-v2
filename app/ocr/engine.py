@@ -22,6 +22,39 @@ try:
 except ImportError:  # pragma: no cover - missing optional dependency
     pytesseract = None
 from app.omr.preprocessor import Preprocessor
+from app.omr.dynamic import find_box_rows, _filled_box_span
+
+
+def _identity_rows(aligned_bgr: np.ndarray, is_200q: bool):
+    """Locate the HT and name box rows on the sheet.
+
+    Returns (ht_row, name_row) BoxRows, or (None, None) when either row
+    cannot be found confidently. The fixed reader cuts its HT/name
+    strips from hardcoded coordinates, but the warp does not pin the
+    rows there (observed HT starts on 200Q sheets: 521, 478, 437), so
+    a hardcoded strip cuts off the first boxes (the 388772/388773
+    sheets lost the first 2: 'D2025KTS...' for 'KKD2025KTS...',
+    'RUTHI' for 'MARUTHI'). Callers use the detected rows to cut
+    their strips instead.
+    """
+    if is_200q:
+        ht_band, name_band = (175, 226), (225, 275)
+    else:
+        ht_band, name_band = (208, 266), (254, 314)
+    try:
+        rows = find_box_rows(aligned_bgr)
+    except Exception:
+        return None, None
+
+    def _pick(band):
+        cands = [r for r in rows
+                 if band[0] <= r.y <= band[1] and r.num_boxes >= 10]
+        if not cands:
+            return None
+        centre = (band[0] + band[1]) // 2
+        return max(cands, key=lambda r: (r.num_boxes, -abs(r.y - centre)))
+
+    return _pick(ht_band), _pick(name_band)
 
 # Configure local offline Tesseract binary path if available
 if pytesseract is not None:
@@ -235,15 +268,74 @@ class OCREngine:
             left_marks, right_marks, _ = Preprocessor.detect_timing_tracks(aligned_bgr)
             is_200q = (len(left_marks) >= 53 or len(right_marks) >= 53)
 
-        # 1. Coordinate regions on calibrated canvas (1644 x 2272)
-        if is_200q:
-            ht_raw = aligned_bgr[175:226, 515:1115]
-            name_raw = aligned_bgr[225:275, 515:1485]
-            roll_area = aligned_bgr[175:226, 880:1115]
+        # 0. Follow the printed rows. The fixed strips below assume the
+        # HT/name rows start at x=515 (200Q) / x=440 (160Q), but the warp
+        # does not pin the rows there (observed starts 437-521), so a
+        # hardcoded strip cuts off the first boxes. When both rows are
+        # found on the sheet, cut the strips from the rows themselves,
+        # trimmed to the filled boxes (as the dynamic reader does) so
+        # the OCR does not invent letters from the empty boxes. When a
+        # row cannot be found, or a field is blank, fall back to the
+        # hardcoded coordinates (behaviour exactly as before).
+        ht_row, name_row = _identity_rows(aligned_bgr, is_200q)
+        row_based = ht_row is not None and name_row is not None
+        if row_based:
+            # If the row is already where the template expects it
+            # (within half a box), keep the hardcoded strip: its
+            # geometry is the known-good one the OCR was tuned on
+            # (348819 reads '00627' there — 1 digit off and
+            # roster-fixable — while a row-based strip reads '50162'
+            # on the same handwriting). Only follow the row when it
+            # is actually shifted.
+            template_x1 = 515 if is_200q else 440
+            if abs(ht_row.x1 - template_x1) <= 15:
+                row_based = False
+        if row_based:
+            ht_span = _filled_box_span(aligned_bgr, ht_row)
+            name_span = _filled_box_span(aligned_bgr, name_row)
+            if ht_span is None or name_span is None:
+                row_based = False
+        if row_based:
+            # A small margin around the row: the detected row bounds are
+            # the printed outlines, and a strip cut exactly to them
+            # clips character tops/bottoms and reads worse (348819's
+            # '7' read as '4' in a tight strip, '7' in a margined one).
+            # Both strips are trimmed to the filled boxes so the OCR
+            # does not invent letters from the empty boxes — a full-row
+            # strip spaces the characters out and trips the missing-HT
+            # check on short hall tickets (img0076's AP05CJ1798).
+            m = 6
+            h_img, w_img = aligned_bgr.shape[:2]
+            ht_x1 = max(0, ht_row.boxes[ht_span[0]][0] - m)
+            ht_x2 = min(w_img, ht_row.boxes[ht_span[1]][0]
+                        + ht_row.boxes[ht_span[1]][2] + m)
+            ht_raw = aligned_bgr[max(0, ht_row.y1 - m):ht_row.y2 + m,
+                                 ht_x1:ht_x2]
+            nm_x1 = max(0, name_row.boxes[name_span[0]][0] - m)
+            nm_x2 = min(w_img, name_row.boxes[name_span[1]][0]
+                        + name_row.boxes[name_span[1]][2] + m)
+            name_raw = aligned_bgr[max(0, name_row.y1 - m):name_row.y2 + m,
+                                   nm_x1:nm_x2]
+            # Roll digits are boxes 11-15 of the HT row (200Q: 10-char
+            # prefix + 5-digit roll; 160Q: 11-char prefix + 5-digit
+            # roll). The ink check covers them.
+            ht_box_w = (ht_row.x2 - ht_row.x1) / float(ht_row.num_boxes)
+            roll_first = 10 if is_200q else 11
+            roll_x1 = int(round(ht_row.x1 + roll_first * ht_box_w))
+            roll_area = aligned_bgr[ht_row.y1:ht_row.y2,
+                                    roll_x1:ht_row.x2]
         else:
-            ht_raw = aligned_bgr[208:266, 440:1145]
-            name_raw = aligned_bgr[254:314, 442:1248]
-            roll_area = aligned_bgr[220:259, 840:1060]
+            # 1. Coordinate regions on calibrated canvas (1644 x 2272)
+            if is_200q:
+                ht_raw = aligned_bgr[175:226, 515:1115]
+                name_raw = aligned_bgr[225:275, 515:1485]
+                roll_area = aligned_bgr[175:226, 880:1115]
+            else:
+                ht_raw = aligned_bgr[208:266, 440:1145]
+                name_raw = aligned_bgr[254:314, 442:1248]
+                roll_area = aligned_bgr[220:259, 840:1060]
+            ht_box_w = None
+            roll_first = 10 if is_200q else 11
         
         # Check ink in the 5 roll number boxes (in inverted Red channel)
         _, _, r_roll = cv2.split(roll_area)
@@ -312,7 +404,17 @@ class OCREngine:
 
         # 4. Secondary Roll Strip Recognition (focused roll boxes)
         # Avoids prefix bleed and phantom borders, ensuring clean recognition of digits.
-        if is_200q:
+        if row_based:
+            # Roll digits sit at boxes roll_first..roll_first+4 of the
+            # detected row; convert the strip-relative position to pad_ht
+            # coordinates (2.5x zoom + 30px left padding).
+            roll_start_x = int(round(
+                2.5 * ((ht_row.x1 + roll_first * ht_box_w) - ht_x1) + 30))
+            roll_end_default = min(
+                pad_ht.shape[1],
+                int(round(2.5 * ((ht_row.x1 + (roll_first + 5) * ht_box_w)
+                                 - ht_x1) + 30)))
+        elif is_200q:
             roll_start_x = 912
             roll_end_default = min(pad_ht.shape[1], 1354)
         else:
@@ -372,30 +474,70 @@ class OCREngine:
         c_roll = float(preds_r[0][1]) if preds_r and preds_r[0][1] > 0.05 else 0.0
         c_ht = float(preds_ht[0][1]) if preds_ht and preds_ht[0][1] > 0.05 else 0.0
 
+        # Expected roll length: the trailing digits after the exam prefix.
+        # The merge below hardcodes a 5-digit roll (KTS/160Q formats),
+        # but the AP format has a 4-digit roll (AP05CJ1798) — padding it
+        # to 5 invents a leading 0 ('AP05CJ01798'). When the rows were
+        # found, the filled boxes give the true hall-ticket length, so
+        # the roll length is exact even when the OCR drops a leading
+        # zero ('0211' -> '00211'). Otherwise (no rows found) keep the
+        # long-standing 5.
+        if row_based:
+            num_filled = ht_span[1] - ht_span[0] + 1
+            if exam_prefix and exam_prefix.strip():
+                # The exam prefix may belong to a different exam than
+                # the sheet (roster prefix KKD on an AP sheet): if it
+                # is longer than the sheet's hall ticket it cannot be
+                # this sheet's prefix, so use the sheet's own prefix
+                # length instead.
+                exp_from_exam = num_filled - len(exam_prefix.strip())
+                if 1 <= exp_from_exam <= 6:
+                    expected_roll_len = exp_from_exam
+                else:
+                    p_len = (len(disambiguated_ht) - len(strip_digits)
+                             if strip_digits else len(disambiguated_ht))
+                    expected_roll_len = num_filled - p_len
+            elif strip_digits:
+                expected_roll_len = num_filled - (
+                    len(disambiguated_ht) - len(strip_digits))
+            else:
+                expected_roll_len = 5
+        else:
+            expected_roll_len = 5
+        if expected_roll_len < 1 or expected_roll_len > 6:
+            expected_roll_len = 5
+
         roll_source = "roll"
         roll_num_str = ""
 
         # Reconcile roll digits between secondary roll strip and full strip
-        if len(strip_digits) == 5 and strip_digits.isdigit() and (len(mapped_roll_str) != 5 or c_ht >= c_roll):
+        if len(strip_digits) == expected_roll_len and strip_digits.isdigit() and (len(mapped_roll_str) != expected_roll_len or c_ht >= c_roll):
             roll_num_str = strip_digits
             roll_source = "strip"
-        elif len(mapped_roll_str) == 5 and mapped_roll_str.isdigit():
+        elif len(mapped_roll_str) == expected_roll_len and mapped_roll_str.isdigit():
             roll_num_str = mapped_roll_str
             roll_source = "roll"
         elif len(strip_digits) >= 3 and strip_digits.isdigit() and c_ht >= c_roll - 0.05:
-            roll_num_str = strip_digits.zfill(5)
+            roll_num_str = strip_digits.zfill(expected_roll_len)
             roll_source = "strip"
         elif len(mapped_roll_str) >= 1 and mapped_roll_str.isdigit():
-            roll_num_str = mapped_roll_str[-5:].zfill(5)
+            roll_num_str = mapped_roll_str[-expected_roll_len:].zfill(expected_roll_len)
             roll_source = "roll"
         elif len(strip_digits) >= 1:
-            roll_num_str = strip_digits.zfill(5)
+            roll_num_str = strip_digits.zfill(expected_roll_len)
             roll_source = "strip"
 
         # 4b. Sliced per-box digit classification for ambiguous or short roll numbers
-        if len(roll_num_str) < 5 or roll_num_str == "00000":
+        if len(roll_num_str) < expected_roll_len or roll_num_str == "0" * expected_roll_len:
             box_digits = []
-            if is_200q:
+            if row_based:
+                # Boxes of the detected row, in cl_ht coordinates (2.5x
+                # the strip); x_start_ht is the row start within the
+                # strip (0 when the filled span starts at box 1).
+                box_w_ht = 2.5 * ht_box_w
+                x_start_ht = 2.5 * (ht_row.x1 - ht_x1)
+                range_boxes = range(roll_first, roll_first + 5)
+            elif is_200q:
                 box_w_ht = 1500.0 / 17.0  # 17 boxes total (10 prefix + 5 roll + 2 trailing empty)
                 x_start_ht = 0.0
                 range_boxes = range(10, 15)
@@ -413,7 +555,7 @@ class OCREngine:
                     if d:
                         box_digits.append(d)
             if len(box_digits) >= 1:
-                box_roll_str = "".join(box_digits).zfill(5)
+                box_roll_str = "".join(box_digits).zfill(expected_roll_len)
                 if not roll_num_str or len(mapped_roll_str) < len(box_digits):
                     roll_num_str = box_roll_str
                     roll_source = "box_classifier"
@@ -430,16 +572,16 @@ class OCREngine:
                     p_sheet = re.sub(r'K[7TF\+\=][358SsZz]', 'KTS', p_sheet, flags=re.IGNORECASE)
 
                 p_exam = exam_prefix.strip()
-                dist_sheet = re.match(r'^[A-Z]+', p_sheet)
-                dist_exam = re.match(r'^[A-Z]+', p_exam)
-                ds_str = dist_sheet.group(0) if dist_sheet else ""
-                de_str = dist_exam.group(0) if dist_exam else ""
                 from difflib import SequenceMatcher
-                sim_dist = SequenceMatcher(None, ds_str, de_str).ratio() if (ds_str and de_str) else 0.0
-
-                # Genuine distinct district requires >= 3 letters in both and low similarity (e.g. CDVM vs KNL, RJY vs KKD)
+                # Compare the whole prefixes, not just the leading
+                # letters: a 2-letter district code ('AP' in AP05CJ)
+                # is a genuine different exam from KKD, while a short
+                # OCR fragment ('KD' of KKD) must not override the
+                # exam prefix. A sheet prefix of >= 4 chars that is
+                # very dissimilar to the exam prefix is kept as-is.
+                sim_prefix = SequenceMatcher(None, p_sheet, p_exam).ratio()
                 is_different_district = (
-                    len(ds_str) >= 3 and len(de_str) >= 3 and sim_dist < 0.40 and ds_str[:2] != de_str[:2]
+                    len(p_sheet) >= 4 and sim_prefix < 0.40
                 )
 
                 if is_different_district:
