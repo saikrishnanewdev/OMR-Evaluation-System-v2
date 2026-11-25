@@ -28,8 +28,8 @@ Detection notes (from the Syam photos):
     We therefore detect the long row rectangle, then split it into
     square boxes using its own height (boxes are square).
   * Empty bubbles still contain a small printed 1/2/3/4, so fill is
-    judged from the *centre* of each circle only, exactly like
-    BubbleDetector does, not from the whole circle.
+    judged from the *centre* of each circle only, not from the whole
+    circle.
   * Above the ANSWERS section there are other bubbles (Booklet Code
     A-D, Booklet Number). They are ignored: bubble search only runs
     below the "ANSWERS" heading, or below the top third of the page
@@ -546,13 +546,23 @@ def _recognise_strip(pad: np.ndarray, ocr_engine) -> str:
 
 
 def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
-                       ocr_engine=None) -> str:
+                       ocr_engine=None, expand_bottom: float = 0.0) -> str:
     """Read the handwriting in one box row using the existing OCR engine.
 
     Crops the row to the filled boxes only, removes the red printed
     lines and zooms 2.5x first — the same cleaning OCREngine uses for
     its fixed strips — then runs the strip through RapidOCR's text
     recogniser. Returns "" when no OCR engine is available.
+
+    expand_bottom stretches the strip downward by that fraction of
+    the row height before reading. Handwriting can dip below the
+    detected row (the row is found from the red box lines, but the
+    ink sits low in the boxes), and the taller strip reads it: on
+    OMR_348819 the normal strip reads 'KKD2025K7300694' while the
+    strip with expand_bottom=0.25 reads 'KKD2025KTS01624', which the
+    roster corrects to the true 'KKD2025KTS01627'. The primary read
+    keeps expand_bottom=0.0 — the taller strip is only a second
+    opinion, because on some sheets (img0076) it reads worse.
     """
     if ocr_engine is None:
         return ""
@@ -569,6 +579,10 @@ def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
                 row,
                 x1=row.boxes[first][0],
                 x2=row.boxes[last][0] + row.boxes[last][2])
+        if expand_bottom:
+            pad = int(round((row.y2 - row.y1) * expand_bottom))
+            if pad > 0:
+                row = replace(row, y2=row.y2 + pad)
         _raw, pad = _row_strip_images(image_bgr, row, ocr_engine)
         return _recognise_strip(pad, ocr_engine)
     except Exception:
@@ -649,6 +663,12 @@ class DynamicIdentity:
     # The primary name is the first of these; callers try the rest
     # only when the primary does not reconcile against the roster.
     name_candidates: List[str] = field(default_factory=list)
+    # Second reading of the hall-ticket row, from a taller strip
+    # (see read_box_row_strip's expand_bottom). A second opinion on
+    # the same row, used by the identity vote: when the two readings
+    # disagree, the roster decides. Empty when it agrees with the
+    # primary reading (or when there is no hall-ticket row).
+    hall_ticket_alt: str = ""
 
 
 def extract_identity_dynamic(image_bgr: np.ndarray,
@@ -705,18 +725,30 @@ def extract_identity_dynamic(image_bgr: np.ndarray,
         name_cands_clean.insert(0, name_clean)
     elif not name_clean and name_cands_clean:
         name_clean = name_cands_clean[0]
+    # The filled-box count is the true character count (one
+    # character per box); it exposes a merged character.
+    ht_expected_len = None
+    if ht_row is not None:
+        span = _filled_box_span(image_bgr, ht_row)
+        if span is not None:
+            ht_expected_len = span[1] - span[0] + 1
     if ht_clean:
         # Fix look-alike misreads (0/O, 5/S, J/1) against the exam
         # prefix when one is known — a mismatched prefix is ignored.
-        # The filled-box count is the true character count (one
-        # character per box); it exposes a merged character.
-        ht_expected_len = None
-        if ht_row is not None:
-            span = _filled_box_span(image_bgr, ht_row)
-            if span is not None:
-                ht_expected_len = span[1] - span[0] + 1
         ht_clean = correct_hall_ticket(ht_clean, prefix=exam_prefix,
                                        expected_len=ht_expected_len)
+
+    # Second opinion on the same hall-ticket row (taller strip —
+    # see read_box_row_strip). Only kept when it differs from the
+    # primary reading; the identity vote decides between them.
+    ht_alt = ""
+    if ht_row is not None and ocr_engine is not None:
+        alt_text = read_box_row_strip(image_bgr, ht_row, ocr_engine,
+                                      expand_bottom=0.25)
+        alt_clean = re.sub(r"[^A-Za-z0-9]", "", alt_text).upper()
+        if alt_clean and alt_clean != ht_clean:
+            ht_alt = correct_hall_ticket(alt_clean, prefix=exam_prefix,
+                                         expected_len=ht_expected_len)
 
     conf = 0.0
     if ht_clean:
@@ -728,7 +760,8 @@ def extract_identity_dynamic(image_bgr: np.ndarray,
     return DynamicIdentity(hall_ticket=ht_clean, name=name_clean,
                            confidence=conf, method=method,
                            hall_ticket_row=ht_row, name_row=name_row,
-                           name_candidates=name_cands_clean)
+                           name_candidates=name_cands_clean,
+                           hall_ticket_alt=ht_alt)
 
 
 @dataclass
@@ -859,7 +892,9 @@ class DynamicBubbleRow:
 
 
 def _classify_fills(fills: List[float]) -> Tuple[str, str, float]:
-    """Same rules as BubbleDetector: centre fill + dominance ratio."""
+    """Centre fill + dominance ratio: the strongest option wins only
+    when it is clearly darker than the rest; two strong options is
+    a double mark; none strong is blank."""
     if len(fills) != len(OPTION_NAMES):
         return "BLANK", "UNATTEMPTED", 0.0
     order = sorted(range(len(fills)), key=lambda i: fills[i], reverse=True)
@@ -1382,8 +1417,8 @@ def analyze_sheet_dynamic(image_bgr: np.ndarray,
 
 
 def dynamic_rows_to_detected(sheet: DynamicSheet) -> Dict[int, Dict]:
-    """Convert dynamic bubble rows to BubbleDetector's result format,
-    so ScoringEngine can score them unchanged."""
+    """Convert dynamic bubble rows to the result format
+    ScoringEngine expects, so it can score them unchanged."""
     out: Dict[int, Dict] = {}
     for q, row in sheet.rows.items():
         fills = row.fills
