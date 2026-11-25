@@ -12,12 +12,7 @@ from app.models.entities import ProcessedSheet, Examination, QuestionResult
 from app.database.repository import Repository, repository
 from app.services.evaluation_service import EvaluationService, evaluation_service
 from app.omr.preprocessor import Preprocessor
-from app.omr.template import OMRTemplate, standard_template
 from app.ui.widgets.image_viewer import ImageViewer
-from app.config.constants import (
-    HT_FIELD_X_START, HT_FIELD_Y_START, HT_FIELD_X_END, HT_FIELD_Y_END,
-    BUBBLE_RADIUS
-)
 
 
 class ManualReviewView(QWidget):
@@ -34,7 +29,6 @@ class ManualReviewView(QWidget):
         super().__init__(parent)
         self.repo = repo
         self.service = service
-        self.template = standard_template
         self.current_exam: Optional[Examination] = None
         self.current_sheet: Optional[ProcessedSheet] = None
         self._setup_ui()
@@ -247,29 +241,13 @@ class ManualReviewView(QWidget):
             raw_img = Preprocessor.load_image(file_path)
             aligned_img, _ = Preprocessor.align_and_deskew(raw_img)
             self.viewer.set_cv_image(aligned_img)
-
-            # Add overlays
-            # 1. Identification Box highlight
-            self.viewer.highlight_box(
-                HT_FIELD_X_START, HT_FIELD_Y_START - 5,
-                HT_FIELD_X_END - HT_FIELD_X_START, HT_FIELD_Y_END - HT_FIELD_Y_START + 10,
-                "#FFCC00"
-            )
-
-            # 2. Bubble Overlays
-            opt_map = {"A": 0, "B": 1, "C": 2, "D": 3}
-            for q_num, resp in sheet.responses.items():
-                if resp.detected_option in opt_map:
-                    opt_idx = opt_map[resp.detected_option]
-                    cx, cy = self.template.get_bubble_center(q_num, opt_idx)
-                    color = "#107C41" if resp.classification == "CORRECT" else "#E81123"
-                    self.viewer.add_bubble_overlay(cx, cy, BUBBLE_RADIUS, color, f"Q{q_num}: {resp.detected_option}")
-                elif resp.classification in ("MULTI", "AMBIGUOUS"):
-                    for opt_idx in range(4):
-                        cx, cy = self.template.get_bubble_center(q_num, opt_idx)
-                        self.viewer.add_bubble_overlay(cx, cy, BUBBLE_RADIUS, "#D83B01", f"Q{q_num}: {resp.classification}")
+            # No overlays: bubble positions are found dynamically per
+            # sheet now, so there is no fixed template to draw the
+            # hall-ticket box or the bubble circles from. The image
+            # itself and the responses table below are the review
+            # surface.
         except Exception as e:
-            print(f"Error rendering canvas overlays: {e}")
+            print(f"Error rendering canvas: {e}")
 
     def _populate_responses_table(self, sheet: ProcessedSheet) -> None:
         self.resp_table.setRowCount(len(sheet.responses))
