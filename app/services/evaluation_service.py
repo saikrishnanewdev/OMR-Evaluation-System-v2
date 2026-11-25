@@ -6,8 +6,6 @@ from app.models.entities import (
     Examination, AnswerKey, ProcessedSheet, QuestionResult, AuditCorrection
 )
 from app.omr.preprocessor import Preprocessor
-from app.omr.template import OMRTemplate, standard_template, get_template
-from app.omr.bubble_detector import BubbleDetector
 from app.ocr.engine import OCREngine, ocr_engine
 from app.evaluation.scoring_engine import ScoringEngine
 from app.evaluation.ranking_engine import RankingEngine
@@ -20,13 +18,10 @@ class EvaluationService:
     def __init__(
         self,
         repo: Optional[Repository] = None,
-        template: Optional[OMRTemplate] = None,
         ocr: Optional[OCREngine] = None
     ):
         self.repo = repo or repository
-        self.template = template or standard_template
         self.ocr = ocr or ocr_engine
-        self.bubble_detector = BubbleDetector(self.template)
 
     def process_single_sheet(
         self,
@@ -36,6 +31,13 @@ class EvaluationService:
     ) -> ProcessedSheet:
         """
         Processes a single OMR sheet from raw image file to scored and persisted record.
+
+        Everything is read dynamically from the sheet itself: the
+        hall-ticket and name rows are found from the printed labels,
+        and the answer bubbles are found from the pink answer columns
+        below ANSWERS. There is no fixed template. A sheet on which
+        dynamic detection finds no answer columns and no identity is
+        rejected as not an OMR answer sheet.
         """
         file_path = Path(file_path)
         if not file_path.exists():
@@ -50,12 +52,7 @@ class EvaluationService:
         if existing and existing.status in ("SUCCESS", "VERIFIED"):
             return existing
 
-        # 1. Load image & preprocess
-        raw_bgr = Preprocessor.load_image(file_path)
-
-        # Check if file is a valid OMR answer sheet (must have timing tracks)
-        left_m, right_m, _ = Preprocessor.detect_timing_tracks(raw_bgr)
-        if len(left_m) < 15 or len(right_m) < 15:
+        def _rejected(reason: str, skew: float = 0.0) -> ProcessedSheet:
             sheet = ProcessedSheet(
                 id=existing.id if existing else None,
                 exam_id=exam.id,
@@ -67,33 +64,39 @@ class EvaluationService:
                 candidate_name_ocr="",
                 candidate_name_final="",
                 status="REJECTED",
-                review_reason="Not an OMR answer sheet (missing timing tracks).",
+                review_reason=reason,
                 correct_count=0,
                 wrong_count=0,
                 unattempted_count=0,
                 total_marks=0.0,
                 student_rank=0,
-                skew_angle=0.0,
+                skew_angle=skew,
                 responses={}
             )
             self.repo.save_processed_sheet(sheet)
             return sheet
 
-        aligned_bgr, skew_angle = Preprocessor.align_and_deskew(raw_bgr)
-        ink_map = Preprocessor.extract_ink_channel(aligned_bgr)
-        # Dynamic detection normally runs on the warped `aligned_bgr`
-        # (that is the path proven on the 160Q sample: 107/53/53.5).
+        # 1. Load image & preprocess (straighten the page via the
+        # timing marks). If the page cannot be straightened at all,
+        # it is not a scannable sheet.
+        raw_bgr = Preprocessor.load_image(file_path)
+        try:
+            aligned_bgr, skew_angle = Preprocessor.align_and_deskew(raw_bgr)
+        except Exception:
+            return _rejected("Not an OMR answer sheet (page could not be aligned).")
+
+        # Dynamic detection normally runs on the warped `aligned_bgr`.
         # But the warp can cut the top of the page off when the timing
         # track is only partially detected — on the 200Q Syam sheet
         # the first detected mark sat far below the real top of the
         # track, so the hall-ticket row mapped to y < 0 and identity
-        # came back blank (old tool) or garbage (dynamic on warped).
-        # A box row touching the top edge (y1 == 0) is the tell-tale
-        # sign of that cut-off. In that case dynamic runs on a
-        # deskewed-only copy of the raw scan instead (see
+        # came back blank. A box row touching the top edge is the
+        # tell-tale sign of that cut-off. In that case dynamic runs
+        # on a deskewed-only copy of the raw scan instead (see
         # Preprocessor.deskew_only), where the whole page stays in
-        # frame; the fixed-template fallback still uses the warped
-        # image as before.
+        # frame. Sheets with no timing track at all (the 20Q strip
+        # and the 50Q photo) also read from the deskewed-only copy:
+        # the warp to the reference points would distort them.
         try:
             deskewed_bgr, _ = Preprocessor.deskew_only(raw_bgr)
         except Exception:
@@ -101,11 +104,12 @@ class EvaluationService:
         dyn_image = aligned_bgr
         try:
             from app.omr.dynamic import top_is_cut_off
-            if top_is_cut_off(aligned_bgr):
+            left_m, right_m, _ = Preprocessor.detect_timing_tracks(raw_bgr)
+            no_track = len(left_m) < 2 and len(right_m) < 2
+            if top_is_cut_off(aligned_bgr) or no_track:
                 dyn_image = deskewed_bgr
         except Exception:
             pass
-        is_200q = (len(left_m) >= 53 or len(right_m) >= 53) or (exam and exam.total_questions == 200)
 
         # The key PDF only tells us how many questions to expect:
         # its item count is the question count, nothing about layout.
@@ -118,21 +122,20 @@ class EvaluationService:
         if not expected_q:
             expected_q = exam.total_questions if (exam and exam.total_questions) else 160
 
-        # 2. Dynamic detection first — no layout, no fixed coordinates.
+        # 2. Dynamic detection — no layout, no fixed coordinates.
         #    Find the label, read the boxes on the same line; find the
         #    question number, read the 4 circles on the same line.
-        #    Falls back to the fixed template below when it cannot
-        #    find enough of the sheet.
+        prefix = exam.code.strip() if (exam and exam.code and exam.code.strip()) else None
         detected_results = None
         ht_text = name_text = ""
         ocr_conf = 0.0
         ht_valid = False
-        used_dynamic = False
         try:
             from app.omr.dynamic import (
                 analyze_sheet_dynamic, dynamic_rows_to_detected)
             dyn = analyze_sheet_dynamic(
-                dyn_image, expected_questions=expected_q, ocr_engine=self.ocr)
+                dyn_image, expected_questions=expected_q,
+                ocr_engine=self.ocr, exam_prefix=prefix)
             if dyn.method == "dynamic" and dyn.found_questions >= 1:
                 detected_results = dynamic_rows_to_detected(dyn)
                 if dyn.identity.hall_ticket or dyn.identity.name:
@@ -140,8 +143,7 @@ class EvaluationService:
                     _ht = dyn.identity.hall_ticket or ""
                     _nm = dyn.identity.name or ""
                     # Only trust dynamic identity if it looks like a
-                    # real hall ticket / name; otherwise the fixed
-                    # reader below gets a chance instead.
+                    # real hall ticket / name.
                     if _ht and not _re.match(r"^[A-Z0-9]{4,20}$", _ht):
                         _ht = ""
                     if _nm and len(_nm) < 3:
@@ -149,30 +151,26 @@ class EvaluationService:
                     ht_text, name_text = _ht, _nm
                     ocr_conf = dyn.identity.confidence
                     ht_valid = bool(_ht)
-                used_dynamic = True
         except Exception:
             detected_results = None
-            used_dynamic = False
 
+        if detected_results is None and not ht_text and not name_text:
+            # Dynamic found no answer columns and no identity: this
+            # is not an OMR answer sheet. (There is no fixed-template
+            # fallback any more — a sheet dynamic cannot read is
+            # rejected, not guessed at.)
+            return _rejected(
+                "Not an OMR answer sheet (no answer columns found).",
+                skew=round(skew_angle, 2))
         if detected_results is None:
-            # 2b. Fallback: fixed template matching exam total questions.
-            total_q = 200 if is_200q else (exam.total_questions if (exam and exam.total_questions) else 160)
-            template = get_template(total_q)
-            detector = BubbleDetector(template)
-            detected_results = detector.analyze_sheet(ink_map, timing_marks=(left_m, right_m), image_bgr=aligned_bgr)
+            # Identity found but no bubbles: score every question
+            # as unattempted.
+            detected_results = {}
 
-        # 3. Student Identification (Hall Ticket and Candidate Name)
-        #    Only run the fixed-position reader when dynamic did not
-        #    already find the identity.
-        if not ht_text and not name_text:
-            prefix = exam.code.strip() if (exam and exam.code and exam.code.strip()) else None
-            ht_text, name_text, ocr_conf, ht_valid = self.ocr.extract_identity(
-                aligned_bgr, exam_prefix=prefix, is_200q=is_200q
-            )
         ht_conf = ocr_conf
         name_conf = ocr_conf
 
-        # 4. Deterministic Scoring
+        # 3. Deterministic Scoring
         scorer = ScoringEngine(
             correct_mark=exam.correct_mark,
             wrong_mark=exam.wrong_mark,
