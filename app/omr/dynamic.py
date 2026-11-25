@@ -107,6 +107,99 @@ class BoxRow:
         return float(self.y2 - self.y1)
 
 
+def _row_boxes(mask: np.ndarray, x: int, y: int, bw: int, bh: int):
+    """Box count and box rects for a row rect, from its vertical dividers.
+
+    Returns (n, boxes); n < 4 means 'not a box row'. The dividers
+    are counted exactly from the red columns inside the row, not
+    from width/height — the printed stroke inflates the height a
+    little and width/height alone undercounts by one on some sheets.
+    """
+    col_sum = mask[y:y + bh, x:x + bw].sum(axis=0) / 255.0
+    above = col_sum > bh * 0.6
+    dividers = 0
+    in_line = False
+    for v in above:
+        if v and not in_line:
+            dividers += 1
+            in_line = True
+        elif not v:
+            in_line = False
+    n = dividers - 1 if dividers >= 5 else int(round(bw / float(bh)))
+    if n < 4:
+        return 0, []
+    box_w = bw / float(n)
+    boxes = []
+    for i in range(n):
+        bx = int(round(x + i * box_w))
+        bx2 = int(round(x + (i + 1) * box_w))
+        boxes.append((bx, y, max(1, bx2 - bx), bh))
+    return n, boxes
+
+
+def _split_tall_strip(mask: np.ndarray, x: int, y: int, bw: int,
+                     bh: int) -> List[Tuple[int, int]]:
+    """Split a too-tall red strip into its box-row bands.
+
+    Several box rows joined by a vertical red line (150Q sheet: the
+    name row is joined to the gender/community rows, and to the top
+    of the answer block) form one tall contour that the row finder
+    would reject outright. A row band is a run of y where the red
+    spans most of the strip width (box dividers and row edges);
+    between rows only the thin vertical line is red, so the red
+    spans a few pixels. Returns [(y1, y2), ...] bands.
+    """
+    sub = mask[y:y + bh, x:x + bw]
+    spread = np.zeros(bh, dtype=int)
+    for i in range(bh):
+        xs = np.flatnonzero(sub[i] > 0)
+        if len(xs):
+            spread[i] = int(xs[-1] - xs[0])
+    gap = spread < max(8.0, 0.10 * bw)
+    bands: List[Tuple[int, int]] = []
+    i = 0
+    while i < bh:
+        if gap[i]:
+            i += 1
+            continue
+        j = i
+        while j < bh and not gap[j]:
+            j += 1
+        bands.append((y + i, y + j))
+        i = j
+    return bands
+
+
+def _row_from_band(mask: np.ndarray, x: int, y: int, bw: int, bh: int,
+                   page_w: int, min_h: float, max_h: float):
+    """A BoxRow for one band split from a tall strip, or None.
+
+    The band is narrower than the strip (the gender row is 5 boxes
+    wide while the strip spans the whole name row), so its
+    horizontal extent is recomputed from the mask inside the band.
+    The usual row checks (height, width, box count) still apply, so
+    text lines and answer-block bands are rejected.
+    """
+    if bh < min_h or bh > max_h:
+        return None
+    sub = mask[y:y + bh, x:x + bw]
+    col_sum = sub.sum(axis=0) / 255.0
+    xs = np.flatnonzero(col_sum > bh * 0.3)
+    if len(xs) == 0:
+        return None
+    x1 = x + int(xs[0])
+    x2 = x + int(xs[-1]) + 1
+    bw2 = x2 - x1
+    if bw2 < bh * 4 or bw2 < page_w * 0.08:
+        return None
+    n, boxes = _row_boxes(mask, x1, y, bw2, bh)
+    if n < 4:
+        return None
+    return BoxRow(y=y + bh // 2, y1=y, y2=y + bh, x1=x1, x2=x2,
+                  box_w=bw2 / float(n), box_h=float(bh), num_boxes=n,
+                  boxes=boxes)
+
+
 def find_box_rows(image_bgr: np.ndarray,
                   top_fraction: float = 0.45) -> List[BoxRow]:
     """Find every row of square character boxes in the top of the sheet.
@@ -131,7 +224,19 @@ def find_box_rows(image_bgr: np.ndarray,
     max_h = h * 0.045
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if bh < min_h or bh > max_h:
+        if bh < min_h:
+            continue
+        if bh > max_h:
+            # Several box rows joined by a vertical red line (150Q
+            # sheet: the name row is joined to the gender/community
+            # rows). Split the tall strip at the horizontal gaps
+            # between rows and build a row per band, instead of
+            # rejecting the whole strip (which loses the name row).
+            for (by1, by2) in _split_tall_strip(mask, x, y, bw, bh):
+                row = _row_from_band(mask, x, by1, bw, by2 - by1,
+                                     w, min_h, max_h)
+                if row is not None:
+                    rows.append(row)
             continue
         if bw < bh * 4:      # a box row is much wider than it is tall
             continue
@@ -142,27 +247,10 @@ def find_box_rows(image_bgr: np.ndarray,
         # (columns that are red for most of the row height), not from
         # width/height — the printed stroke inflates the height a little
         # and width/height alone undercounts by one on some sheets.
-        col_sum = mask[y:y + bh, x:x + bw].sum(axis=0) / 255.0
-        above = col_sum > bh * 0.6
-        dividers = 0
-        in_line = False
-        for v in above:
-            if v and not in_line:
-                dividers += 1
-                in_line = True
-            elif not v:
-                in_line = False
-        n = dividers - 1 if dividers >= 5 else int(round(bw / float(bh)))
+        n, boxes = _row_boxes(mask, x, y, bw, bh)
         if n < 4:
             continue
         box_w = bw / float(n)
-        # Re-split evenly so the boxes tile the row exactly.
-        box_w = bw / float(n)
-        boxes = []
-        for i in range(n):
-            bx = int(round(x + i * box_w))
-            bx2 = int(round(x + (i + 1) * box_w))
-            boxes.append((bx, y, max(1, bx2 - bx), bh))
         rows.append(BoxRow(y=y + bh // 2, y1=y, y2=y + bh, x1=x, x2=x + bw,
                            box_w=box_w, box_h=float(bh), num_boxes=n,
                            boxes=boxes))
@@ -251,9 +339,14 @@ def _row_for_label(rows: List[BoxRow], labels: List[Dict],
 
     A row matches when its centre y is within ~1.5 box heights of the
     label centre y, and the row starts to the right of the label.
+    Spaces are ignored on both sides: RapidOCR sometimes returns a
+    label as one word ('HALLTICKETNUMBER' on the 150Q sheet) and
+    sometimes as separate words ('HALL TICKET NUMBER' on the 200Q
+    sheet), and the match must not depend on that.
     """
     for lab in labels:
-        if not any(n in lab["norm"] for n in needles):
+        lab_norm = lab["norm"].replace(" ", "")
+        if not any(n.replace(" ", "") in lab_norm for n in needles):
             continue
         best: Optional[BoxRow] = None
         best_dy = 1e9
@@ -581,6 +674,62 @@ def _classify_fills(fills: List[float]) -> Tuple[str, str, float]:
     return "AMBIGUOUS", "AMBIGUOUS", 0.4
 
 
+def _split_wide_block(mask: np.ndarray, rect: Tuple[int, int, int, int],
+                      page_w: int) -> List[Tuple[int, int, int, int]]:
+    """Split one wide pink block into its answer columns.
+
+    On the 150Q sheet the three answer columns sit in ONE joined
+    pink block (598px wide, 36% of the page), not three separate
+    rectangles, so the column finder below would reject the whole
+    block and Dynamic would find no bubbles at all. The columns are
+    separated by narrow white gaps: the vertical red profile across
+    the block dips to ~0.3 at the gaps while the pink columns sit at
+    ~0.6. Split at the deep valleys that rise back to pink level on
+    both sides. Returns [] when no such valleys exist (the block is
+    then dropped, exactly as before).
+    """
+    x1, y1, x2, y2 = rect
+    if x2 - x1 < 60 or y2 - y1 < 10:
+        return []
+    prof = (mask[y1:y2, x1:x2] > 0).mean(axis=0).astype(float)
+    # Smooth a little so a single stray column does not fake a valley.
+    k = 11
+    pad = np.pad(prof, (k // 2, k // 2), mode="edge")
+    sm = np.convolve(pad, np.ones(k) / k, mode="valid")
+    level = float(np.median(sm))
+    if level <= 0.2:
+        return []
+    thresh = 0.75 * level
+    n = len(sm)
+    valleys: List[int] = []
+    for i in range(60, n - 60):
+        if sm[i] >= thresh:
+            continue
+        if sm[i] != min(sm[max(0, i - 40):i + 41]):
+            continue
+        # Must rise back to pink level on both sides: a ramp at the
+        # block edge (the question-number strip) is not a valley.
+        left = sm[max(0, i - 80):max(0, i - 40)]
+        right = sm[i + 40:i + 81]
+        if len(left) == 0 or len(right) == 0:
+            continue
+        if left.max() < thresh or right.max() < thresh:
+            continue
+        if valleys and i - valleys[-1] < 80:
+            if sm[i] < sm[valleys[-1]]:
+                valleys[-1] = i
+            continue
+        valleys.append(i)
+    if not valleys:
+        return []
+    bounds = [x1] + [x1 + v for v in valleys] + [x2]
+    out = []
+    for a, b in zip(bounds, bounds[1:]):
+        if b - a >= 0.05 * page_w:
+            out.append((a, y1, b, y2))
+    return out if len(out) >= 2 else []
+
+
 def _find_answer_columns(image_bgr: np.ndarray,
                          search_y1: int) -> List[Tuple[int, int, int, int]]:
     """Find the large pink answer-column rectangles below search_y1.
@@ -588,8 +737,10 @@ def _find_answer_columns(image_bgr: np.ndarray,
     On the Syam sheets each question column is a tall pink rectangle
     (the shaded band that holds 40 rows x 4 circles). They are the
     largest red-form contours in the lower half: tall (over 35% of
-    the page height) and narrow (8-18% of the page width). Returns
-    (x1, y1, x2, y2) sorted left to right.
+    the page height) and narrow (8-18% of the page width). A block
+    wider than one column (the 150Q sheet joins three columns into
+    one pink block) is split at its white gaps instead of dropped.
+    Returns (x1, y1, x2, y2) sorted left to right.
     """
     h, w = image_bgr.shape[:2]
     mask = redness_mask(image_bgr)
@@ -597,9 +748,16 @@ def _find_answer_columns(image_bgr: np.ndarray,
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     cols = []
+    wide = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if bh < h * 0.35 or bw < w * 0.05 or bw > w * 0.25:
+        if bh < h * 0.35 or bw < w * 0.05:
+            continue
+        if bw > w * 0.25:
+            # Possibly several answer columns joined into one pink
+            # block (150Q sheet): split it below instead of dropping
+            # it, or the sheet yields no bubbles at all.
+            wide.append((x, y, x + bw, y + bh))
             continue
         if bh < bw * 3:
             continue
@@ -614,6 +772,12 @@ def _find_answer_columns(image_bgr: np.ndarray,
                           max(m[2], c[2]), max(m[3], c[3]))
             continue
         merged.append(c)
+    for rect in wide:
+        for piece in _split_wide_block(mask, rect, w):
+            pw, ph = piece[2] - piece[0], piece[3] - piece[1]
+            if ph >= 3 * pw and w * 0.05 <= pw <= w * 0.25:
+                merged.append(piece)
+    merged.sort(key=lambda c: c[0])
     return merged
 
 
@@ -727,7 +891,6 @@ def _row_centres_from_candidates(cands: List[Tuple[float, float]],
         return [c[0] for c in cl]
     pitch = ((grid_ys[-1] - grid_ys[0]) / (n - 1)
              if n > 1 else 30.0)
-    half = pitch / 2.0
     if len(cl) > n:
         # Too many clusters (a smudge, a stray mark): keep the n
         # strongest ones — a real row has ~4-5 candidates — closest
@@ -737,24 +900,36 @@ def _row_centres_from_candidates(cands: List[Tuple[float, float]],
         keep = sorted(sorted(cl, key=_score, reverse=True)[:n],
                       key=lambda c: c[0])
         return [c[0] for c in keep]
-    # Too few clusters: assign each cluster to its nearest grid row,
-    # in strictly increasing order, within half a pitch. Rows with no
-    # cluster keep the grid value. The half-pitch guard is what keeps
-    # this safe: a cluster more than half a pitch from every grid
-    # row is not forced onto a row (that is how a one-row jump used
-    # to happen). A plain shift search cannot express a gap in the
-    # middle of the column, so it is not used here.
-    out = list(grid_ys)
-    next_row = 0
+    # Too few clusters: fit the row grid to the clusters themselves.
+    # The grid pitch comes from the pink rectangle, which runs past
+    # the last bubble row, so the grid can sit half a pitch off the
+    # real rows (150Q sheet: grid row 0 at 657, first real row at
+    # 674). Snapping each cluster to its nearest grid line then
+    # leaves a spurious grid value in a gap between two real rows
+    # and shifts every row below it by one (150Q sheet 388765: grid
+    # row 1 kept 690, a gap, so Q2 read the gap and Q3 read Q2's
+    # row). Instead, the pitch is the median gap between consecutive
+    # clusters and the first cluster is the first row (no row can
+    # hide above it inside the column rectangle). Each cluster lands
+    # on the fitted row nearest to it, and rows with no cluster take
+    # the fitted value — never a stale grid value in a gap.
+    if len(cl) >= 2:
+        diffs = [cl[i + 1][0] - cl[i][0] for i in range(len(cl) - 1)]
+        fit_pitch = float(np.median(diffs))
+        if fit_pitch <= 0:
+            fit_pitch = pitch
+    else:
+        fit_pitch = pitch
+    fit_ys = [cl[0][0] + i * fit_pitch for i in range(n)]
+    out = list(fit_ys)
     for (cy, _cnt) in cl:
-        best, best_d = None, half
-        for i in range(next_row, n):
-            d = abs(cy - grid_ys[i])
+        best, best_d = None, fit_pitch / 2.0
+        for i in range(n):
+            d = abs(cy - fit_ys[i])
             if d <= best_d:
                 best, best_d = i, d
         if best is not None:
             out[best] = cy
-            next_row = best + 1
     return out
 
 
