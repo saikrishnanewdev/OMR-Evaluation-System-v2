@@ -1,37 +1,16 @@
-"""Automated test suite for dynamic scoring, question ranges, and 200Q physical bubble grid template."""
+"""Automated test suite for dynamic scoring and question ranges.
+
+There are no fixed layouts any more: the question count comes from
+the answer-key PDF and the bubbles are found on the sheet itself, so
+the old 160Q/200Q template geometry and fixed-identity tests are
+gone. Scoring itself is unchanged (see test_centre_sampling.py for
+the dynamic 160Q benchmark: 107 correct on the sample sheet).
+"""
 import pytest
 from pathlib import Path
 from decimal import Decimal
-from app.config.constants import TOTAL_QUESTIONS, TOTAL_QUESTIONS_200
-from app.omr.template import get_template, template_160, template_200
 from app.evaluation.scoring_engine import ScoringEngine
 from app.evaluation.answer_key import AnswerKeyExtractor
-
-
-def test_templates_dimensions_and_properties():
-    """Verify 160Q and 200Q template geometries."""
-    t160 = get_template(160)
-    assert t160.total_questions == 160
-    assert t160.num_columns == 4
-    assert t160.questions_per_column == 40
-    assert len(t160.column_base_x) == 4
-
-    t200 = get_template(200)
-    assert t200.total_questions == 200
-    assert t200.num_columns == 5
-    assert t200.questions_per_column == 40
-    assert len(t200.column_base_x) == 5
-
-    # Verify bubble center bounds
-    for q in (1, 40, 41, 80, 81, 120, 121, 160):
-        x, y = t160.get_bubble_center(q, 0)
-        assert 200 <= x <= 1500
-        assert 1000 <= y <= 2250
-
-    for q in (1, 40, 80, 120, 160, 200):
-        x, y = t200.get_bubble_center(q, 0)
-        assert 200 <= x <= 1500
-        assert 1000 <= y <= 2280
 
 
 def test_dynamic_scoring_two_questions_one_mark():
@@ -116,98 +95,3 @@ def test_parse_200q_pdf_key_if_present():
     assert key_obj.items[1] == "B"
     assert key_obj.items[2] == "A"
     assert key_obj.items[200] == "B"
-
-
-def test_200q_identity_and_roster_reconciliation():
-    """Verify 200Q 17-box HT and 24-box Candidate Name ICR with bottom roster records."""
-    import cv2
-    from app.ocr.engine import OCREngine
-    from app.omr.preprocessor import Preprocessor
-
-    img_path = Path(r"C:\Projects\PC\Syam\FeedBack\TESTING\OMR_343526.jpg")
-    if not img_path.exists():
-        pytest.skip("Test file OMR_343526.jpg not found.")
-
-    engine = OCREngine()
-    im = cv2.imread(str(img_path))
-    aligned, _ = Preprocessor.align_and_deskew(im)
-
-    roster = [
-        {"roll": "KKD2025KTS00173", "name": ""},
-        {"roll": "KK2025KTS01123", "name": "KHYMA BHAVANI"},
-        {"roll": "KKD2025KTS00011", "name": "DESA MADHURIMA"},
-        {"roll": "RJY2025KTS02115", "name": "G AADHVIKA"},
-    ]
-
-    ht, name, conf, valid = engine.extract_identity(
-        aligned, exam_prefix="KKD2025KTS", roster=roster, is_200q=True
-    )
-    assert ht == "KK2025KTS01123"
-    assert name == "KHYMA BHAVANI"
-    assert valid is True
-
-
-def test_200q_crossed_7_and_name_dual_signal():
-    """Verify 200Q crossed-7 mapping and dual-signal name disambiguation (OMR_348819 -> KKD2025KTS01627)."""
-    import cv2
-    from app.ocr.engine import OCREngine
-    from app.omr.preprocessor import Preprocessor
-
-    img_path = Path(r"C:\Projects\PC\Syam\FeedBack\AP TESTING 05_11\AP TESTING 05\OMR_348819.jpg")
-    if not img_path.exists():
-        pytest.skip("Test file OMR_348819.jpg not found.")
-
-    engine = OCREngine()
-    im = cv2.imread(str(img_path))
-    aligned, _ = Preprocessor.align_and_deskew(im)
-
-    roster = [
-        {"roll": "KKD2025KTS00062", "name": "KUMMAGIRI HARI BABU"},
-        {"roll": "KKD2025KTS01627", "name": "CH ANIL KUMAR"},
-        {"roll": "KKD2025KTS03027", "name": ""},
-    ]
-
-    ht, name, conf, valid = engine.extract_identity(
-        aligned, exam_prefix="KKD2025KTS", roster=roster, is_200q=True
-    )
-    assert ht == "KKD2025KTS01627"
-    assert name == "CH ANIL KUMAR"
-    assert valid is True
-
-
-def test_200q_bilateral_timing_marks_fallback_and_recovery():
-    """Verify that single-track timing marks safely fall back to standard grid, preventing vertical column drift."""
-    t200 = get_template(200)
-
-    # Mock left tracks (56 marks) and incomplete right tracks (51 marks)
-    mock_left = [(100, 400 + i * 28, 20, 10) for i in range(56)]
-    mock_right = [(1500, 400 + i * 28, 20, 10) for i in range(51)]
-
-    # Single-sided tracks must NOT trigger track projection; must match standard calibrated grid
-    x_single, y_single = t200.get_bubble_center(1, 0, timing_marks_left=mock_left, timing_marks_right=mock_right)
-    x_std, y_std = t200.get_bubble_center(1, 0, timing_marks_left=None, timing_marks_right=None)
-    assert x_single == x_std
-    assert y_single == y_std
-
-    # Real sheet OMR_348820.jpg verification (recovered 33 marks)
-    img_path = Path(r"C:\Projects\PC\Syam\FeedBack\AP TESTING 05_11\AP TESTING 05\OMR_348820.jpg")
-    key_path = Path(r"C:\Projects\PC\Syam\FeedBack\AP TESTING 05_11\AP TESTING 05\AP CONSTABLE (Prelims cum Mains) ‘Khaki’ MODEL TEST-107.pdf")
-    if not (img_path.exists() and key_path.exists()):
-        pytest.skip("Test files for 348820 not found.")
-
-    import cv2
-    from app.omr.preprocessor import Preprocessor
-    from app.omr.bubble_detector import BubbleDetector
-
-    im = cv2.imread(str(img_path))
-    aligned, _ = Preprocessor.align_and_deskew(im)
-    ink_map = Preprocessor.extract_ink_channel(aligned)
-    l_raw, r_raw, _ = Preprocessor.detect_timing_tracks(im)
-    key = AnswerKeyExtractor().extract_from_pdf(key_path)
-
-    det = BubbleDetector(t200).analyze_sheet(ink_map, timing_marks=(l_raw, r_raw))
-    correct_cnt = sum(1 for q, d in det.items() if d.get("detected_option") == key.items.get(q))
-    assert correct_cnt == 33
-
-
-
