@@ -24,6 +24,19 @@ class SyntheticOMRGenerator:
         """Draws a synthetic blank form with timing tracks and printed red bubbles."""
         img = np.full((REF_CANVAS_HEIGHT, REF_CANVAS_WIDTH, 3), 245, dtype=np.uint8)
 
+        # Light-pink answer columns behind the bubbles, as on a real
+        # sheet: the dynamic reader finds the bubbles by first finding
+        # these columns. Without them the sheet has no answer columns
+        # to find (there is no fixed template any more).
+        light_pink = (210, 200, 245)  # BGR
+        for col_idx in range(4):
+            base_x = COLUMN_BASE_X[col_idx]
+            x1 = int(base_x - 20)
+            x2 = int(base_x + 3 * OPTION_PITCH_X + 20)
+            y1 = int(ROW_BASE_Y - 20)
+            y2 = int(ROW_BASE_Y + (QUESTIONS_PER_COLUMN - 1) * ROW_PITCH_Y + 20)
+            cv2.rectangle(img, (x1, y1), (x2, y2), light_pink, -1)
+
         # Draw 49 left and right black timing marks matching calibrated master fiducials
         from app.omr.preprocessor import REF_TIMING_POINTS
         for pt in REF_TIMING_POINTS:
