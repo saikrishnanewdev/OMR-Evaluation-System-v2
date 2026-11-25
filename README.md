@@ -33,11 +33,9 @@ Application/
 │   │   └── repository.py        # Typed CRUD and dashboard query routines
 │   ├── omr/                     # Computer vision & bubble detection engine
 │   │   ├── preprocessor.py      # Registration marks, skew correction, color dropout
-│   │   ├── template.py          # Calibrated coordinate geometry (OMR_AP_DSC_160_V1)
-│   │   └── bubble_detector.py   # Multi-signal bubble fill analysis & classification
+│   │   └── dynamic.py           # Dynamic extraction: labels, box rows & bubbles found on the sheet
 │   ├── ocr/                     # Offline OCR & candidate identification pipeline
-│   │   ├── character_boxes.py   # 16-box segmentation & morphological line filtering
-│   │   └── engine.py            # RapidOCR offline engine with pattern validation
+│   │   └── engine.py            # RapidOCR offline engine with roster reconciliation
 │   ├── evaluation/              # Deterministic scoring, ranking, tie-breaking
 │   │   ├── answer_key.py        # PDF table extraction, validation, immutability
 │   │   ├── scoring_engine.py    # Configurable scoring arithmetic & mark policies
@@ -78,7 +76,6 @@ Application/
 ├── run_tests.bat                # One-click Windows test script
 ├── omr_evaluator.spec           # PyInstaller build configuration
 ├── PROJECT_ANALYSIS.md          # Technical analysis report
-├── OMR_TEMPLATE_SPECIFICATION.md# Form layout & coordinate geometry specification
 ├── ANSWER_KEY_ANALYSIS.md       # PDF key extraction & validation specification
 └── TESTING_STRATEGY.md          # Verification, synthetic test & QA methodology
 ```
