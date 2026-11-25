@@ -1,36 +1,37 @@
 """Unit tests for centre sampling (the row-shift fix).
 
-The bug: the fixed template's rows sat ~25 px (almost one full row)
-below the real bubbles at the top of each column on the 200Q Syam
-sheet (img0076) — its base y (1151) does not match the sheet (first
-real row ~1123.5). So the fixed reader sampled the next row's marks:
-7 lucky corrects and 17 near-miss blanks. The dynamic grid had the
-same weakness in principle (its pitch comes from the pink rectangle's
-height, which runs past the last bubble row).
+The bug: on the 200Q Syam sheet (img0076) the bubble grid's rows
+sat ~25 px (almost one full row) below the real bubbles at the top
+of each column — the grid pitch comes from the pink rectangle's
+height, which runs past the last bubble row. So the reader sampled
+the next row's marks: 7 lucky corrects and 17 near-miss blanks.
 
 The fix: row y-centres come from the real detected circles,
 clustered in top-to-bottom order (_row_centres_from_candidates).
 Clusters in order cannot jump a row — the first cluster is the first
 row, because no row can hide above it inside the column rectangle.
 
-On img0076 this makes fixed and dynamic agree on all 200 questions
-(46/154/0 in both modes, 0 disagreements, verified locally — the
-sheet itself is real candidate data and is not in the repo). The
-160Q sample (in the repo) must not change: its template grid is
-already right, so centre sampling must return the same answers.
+The 160Q sample (in the repo) is the regression anchor: dynamic
+must still read it as 107 correct / 53 wrong / 0 unattempted
+against the SA-08 key.
 """
 
 from pathlib import Path
 
 import cv2
 
-from app.omr.bubble_detector import BubbleDetector
-from app.omr.dynamic import _row_centres_from_candidates
+from app.evaluation.answer_key import AnswerKeyExtractor
+from app.evaluation.scoring_engine import ScoringEngine
+from app.omr.dynamic import (
+    _row_centres_from_candidates,
+    analyze_sheet_dynamic,
+    dynamic_rows_to_detected,
+)
 from app.omr.preprocessor import Preprocessor
-from app.omr.template import get_template
 
 REPO = Path(__file__).resolve().parent.parent
 SAMPLE_IMG = REPO / "OMR_325601.jpg"
+SAMPLE_KEY = REPO / "SA-08.pdf"
 
 
 def _grid(n=40, base=1000.0, pitch=29.0):
@@ -89,22 +90,22 @@ def test_no_candidates_returns_grid():
     assert got == grid
 
 
-def test_fixed_detector_unchanged_on_160q_when_grid_is_right():
-    """Centre sampling must not change answers where the template
-    grid is already right (the 160Q sample): with and without
-    image_bgr, the fixed detector must read every question the same.
-    """
+def test_dynamic_160q_sample_scores_107():
+    """Regression anchor: the real filled 160Q sample must still
+    read 107 correct / 53 wrong / 0 unattempted against the SA-08
+    key (the documented benchmark)."""
     img = cv2.imread(str(SAMPLE_IMG))
-    left_marks, right_marks, _angle = Preprocessor.detect_timing_tracks(img)
+    assert img is not None
     aligned, _angle = Preprocessor.align_and_deskew(img)
-    ink_map = Preprocessor.extract_ink_channel(aligned)
-    detector = BubbleDetector(template=get_template(160))
-    plain = detector.analyze_sheet(
-        ink_map, timing_marks=(left_marks, right_marks))
-    sampled = detector.analyze_sheet(
-        ink_map, timing_marks=(left_marks, right_marks),
-        image_bgr=aligned)
-    assert len(plain) == len(sampled) == 160
-    for q in range(1, 161):
-        assert sampled[q]["detected_option"] == plain[q]["detected_option"], \
-            f"Q{q} changed with centre sampling"
+    dyn = analyze_sheet_dynamic(aligned, expected_questions=160,
+                                ocr_engine=None)
+    assert dyn.method == "dynamic"
+    assert dyn.found_questions == 160
+    key = AnswerKeyExtractor().extract_from_pdf(SAMPLE_KEY)
+    assert len(key.items) == 160
+    scorer = ScoringEngine(correct_mark=0.50, wrong_mark=0.00,
+                           unattempted_mark=0.00, total_questions=160)
+    _, correct, wrong, unattempted, marks, _, _ = scorer.evaluate_sheet(
+        dynamic_rows_to_detected(dyn), key.items)
+    assert (correct, wrong, unattempted) == (107, 53, 0)
+    assert marks == 53.50
