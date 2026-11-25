@@ -19,7 +19,9 @@ Usage:
     python extract_identities_to_excel.py "C:\\path\\to\\folder"
     python extract_identities_to_excel.py "C:\\path\\to\\folder" --key "C:\\path\\to\\key.pdf"
     python extract_identities_to_excel.py "C:\\path\\to\\folder" --mode dynamic
-        --mode auto (default): dynamic only when the warped top is cut off
+        --mode auto (default): dynamic when the warped top is cut off,
+            or when no fixed template exists for the question count
+            (templates cover exactly 160Q and 200Q)
         --mode dynamic: always try dynamic first, fall back to fixed
         --mode fixed: never use dynamic
 """
@@ -753,6 +755,10 @@ def process_folder(
             #   (whole page in frame) with dynamic detection instead.
             #   When the top is intact, the fixed reader below runs
             #   exactly as before.
+            #   Auto also uses dynamic when no fixed template exists
+            #   for the question count (templates cover exactly 160Q
+            #   and 200Q): a 150Q sheet run through the fixed reader
+            #   would get the 160Q template and read garbage.
             # - dynamic: always try dynamic first — on the warped
             #   image when the top is intact, on the deskewed copy
             #   when it is cut off. Falls back to fixed below when
@@ -767,8 +773,10 @@ def process_folder(
                     identity_crops, top_is_cut_off,
                 )
                 top_cut = top_is_cut_off(aligned)
+                no_fixed_template = num_questions not in (160, 200)
                 want_dynamic = (mode == "dynamic"
-                                or (mode == "auto" and top_cut))
+                                or (mode == "auto"
+                                    and (top_cut or no_fixed_template)))
                 if want_dynamic:
                     if top_cut:
                         dyn_image = Preprocessor.deskew_only(img)[0]
