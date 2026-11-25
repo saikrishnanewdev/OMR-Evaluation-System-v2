@@ -588,6 +588,19 @@ class OCREngine:
             r_parts = r_name.split()
             rn_nospace = re.sub(r'\s+', '', r_name)
 
+            # A roster row with a roll number but no name must not win
+            # on a fuzzy hall-ticket match: a garbled read can be
+            # "near" a nameless row and steal the record (348819:
+            # 'KKD2025K7300694' matched 'KKD2025KTS00645', blank name).
+            # A nameless row may only match on an exact hall ticket.
+            if not r_name and has_cand_name:
+                exact_ht = bool(
+                    r_roll and has_cand_ht
+                    and (cand_ht_upper == r_roll
+                         or (clean_raw_ht and clean_raw_ht == r_roll)))
+                if not exact_ht:
+                    continue
+
             # --- Dimension 1: Hall Ticket Matching Score (0.0 to 1.0) ---
             ht_score = 0.0
             if r_roll and has_cand_ht:
@@ -759,6 +772,86 @@ class OCREngine:
         if best_match and best_score >= 0.65:
             return best_match.get("roll"), best_match.get("name")
         return None, None
+
+    def resolve_identity_vote(self, dyn_ht, dyn_name, fixed_ht, fixed_name,
+                              roster=None, preferred_prefix=None):
+        """Pick between the dynamic and fixed identity readings.
+
+        Both readers OCR the same sheet and can disagree (348819:
+        dynamic read 'KKD2025K7300694', fixed read 'KKD2025KTS00627';
+        the sheet says KKD2025KTS01627). When they disagree, the roster
+        decides: the reading whose hall ticket AND name both match a
+        roster student wins. Without a roster, or when neither reading
+        matches a roster student, the dynamic reading stands (it is the
+        mode the user chose, and it is the only one that works on
+        shifted sheets like img0076).
+
+        Returns (ht, name, source) with source "dynamic" or "fixed".
+        The returned hall ticket / name are the roster-reconciled
+        values when the roster matched, else the raw reading.
+        """
+        from difflib import SequenceMatcher
+
+        dyn_ht = (dyn_ht or "").strip()
+        dyn_name = (dyn_name or "").strip()
+        fixed_ht = (fixed_ht or "").strip()
+        fixed_name = (fixed_name or "").strip()
+
+        def _name_sim(a, b):
+            a = re.sub(r"\s+", "", (a or "").upper())
+            b = re.sub(r"\s+", "", (b or "").upper())
+            if not a or not b:
+                return 0.0
+            return SequenceMatcher(None, a, b).ratio()
+
+        def _reconciled(cand_ht, cand_name):
+            if not roster or (not cand_ht and not cand_name):
+                return (None, None)
+            try:
+                return self._reconcile_with_roster(
+                    cand_ht, cand_name, cand_ht, roster,
+                    preferred_prefix=preferred_prefix)
+            except Exception:
+                return (None, None)
+
+        def _win_score(rec, cand_ht, cand_name):
+            """How strongly this reading matches a roster student whose
+            name matches the sheet's own name read (0.0 = no win)."""
+            r_ht, r_name = rec
+            if not r_ht or not r_name:
+                return 0.0
+            if not cand_name:
+                # No name on the sheet: only an exact HT match counts.
+                return 1.0 if r_ht == cand_ht else 0.0
+            sim = _name_sim(cand_name, r_name)
+            return sim if sim >= 0.60 else 0.0
+
+        dyn_rec = _reconciled(dyn_ht, dyn_name)
+        fixed_rec = _reconciled(fixed_ht, fixed_name)
+        dyn_final = (dyn_rec[0] or dyn_ht, dyn_rec[1] or dyn_name)
+        fixed_final = (fixed_rec[0] or fixed_ht, fixed_rec[1] or fixed_name)
+
+        if dyn_ht and fixed_ht and dyn_ht == fixed_ht:
+            return dyn_final[0], dyn_final[1], "dynamic"
+        if dyn_ht and not fixed_ht:
+            return dyn_final[0], dyn_final[1], "dynamic"
+        if fixed_ht and not dyn_ht:
+            # Dynamic found a name but no hall ticket: the name-only
+            # reconciliation may already have found the student.
+            if dyn_rec[0]:
+                return dyn_final[0], dyn_final[1], "dynamic"
+            if _win_score(fixed_rec, fixed_ht,
+                          fixed_name or dyn_name) > 0:
+                return fixed_final[0], fixed_final[1], "fixed"
+            return dyn_final[0], dyn_final[1], "dynamic"
+        if not dyn_ht and not fixed_ht:
+            return dyn_final[0], dyn_final[1], "dynamic"
+
+        dyn_score = _win_score(dyn_rec, dyn_ht, dyn_name)
+        fixed_score = _win_score(fixed_rec, fixed_ht, fixed_name)
+        if fixed_score > dyn_score:
+            return fixed_final[0], fixed_final[1], "fixed"
+        return dyn_final[0], dyn_final[1], "dynamic"
 
     def recognize_hall_ticket(self, image_bgr: np.ndarray, exam_prefix: Optional[str] = None) -> Tuple[str, float, bool]:
         """Recognizes student Hall Ticket Number from character field."""
