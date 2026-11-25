@@ -70,6 +70,27 @@ class AnswerKeyExtractor:
                 items=text_items
             )
 
+        # Simple "SL NO / MARKS" list keys (daily/grand tests: T9 20Q,
+        # T11 50Q). The numbers run as (question, answer) pairs in
+        # reading order — two-column PDFs interleave the columns, so
+        # the pairs are still consecutive tokens. Walk the tokens
+        # expecting Q=1, answer, Q=2, answer, ... and accept only a
+        # complete 1..N run with answers 1-4/A-D, so a stray number
+        # or a tabular key can never be misread as a list key.
+        list_items = self._extract_from_list_text(doc)
+        if list_items:
+            doc.close()
+            key_str = json.dumps({str(k): list_items[k] for k in sorted(list_items.keys())}, sort_keys=True)
+            version_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+            return AnswerKey(
+                exam_id=exam_id,
+                version_number=1,
+                version_hash=version_hash,
+                is_locked=False,
+                source_file=str(pdf_path),
+                items=list_items
+            )
+
         page = doc[0]
         pix = page.get_pixmap(dpi=PDF_RENDER_DPI)
         img_bytes = pix.tobytes("png")
@@ -135,6 +156,40 @@ class AnswerKeyExtractor:
                     items[q] = ans_map.get(a_str.upper(), "?")
 
         return items
+
+    def _extract_from_list_text(self, doc: pymupdf.Document) -> Dict[int, str]:
+        """Parse a plain (question, answer) list key ("SL NO / MARKS").
+
+        The PDF text is a flat run of (question, answer) pairs in
+        reading order — a two-column layout interleaves the columns
+        (1, 26, 2, 27, ...) but each pair stays consecutive, so pair
+        the number tokens in order. A pair is a digit token followed
+        by an answer token (1-4 or A-D); any other token is skipped,
+        so header text and stray numbers cannot shift the pairs.
+        Accept only a complete run Q=1..N (N >= 5), each question
+        once, every answer 1-4/A-D. Returns {} when the text is not
+        such a list (tabular keys, stray numbers), so the caller
+        falls through to grid detection.
+        """
+        ans_map = {"1": "A", "2": "B", "3": "C", "4": "D",
+                   "A": "A", "B": "B", "C": "C", "D": "D"}
+        tokens = []
+        for page in doc:
+            tokens.extend(page.get_text().split())
+        items: Dict[int, str] = {}
+        i = 0
+        while i < len(tokens) - 1:
+            q_tok, a_tok = tokens[i], tokens[i + 1]
+            if q_tok.isdigit() and a_tok in ans_map:
+                q = int(q_tok)
+                if 1 <= q <= 300 and q not in items:
+                    items[q] = ans_map[a_tok]
+                    i += 2
+                    continue
+            i += 1
+        if len(items) >= 5 and set(items) == set(range(1, len(items) + 1)):
+            return items
+        return {}
 
     def _detect_grid(self, img: np.ndarray) -> Tuple[List[int], List[Tuple[int, int, int]]]:
         """
