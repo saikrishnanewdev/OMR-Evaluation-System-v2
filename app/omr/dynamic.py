@@ -520,6 +520,31 @@ def correct_hall_ticket(text: str, prefix: Optional[str] = None,
     return "".join(chars)
 
 
+def _recognise_strip(pad: np.ndarray, ocr_engine) -> str:
+    """Run RapidOCR's text recogniser on a prepared strip image.
+
+    The strip is height-normalised to 48px first (the recogniser
+    expects a fixed-height input); returns "" on any failure.
+    """
+    if pad is None or ocr_engine is None:
+        return ""
+    try:
+        h, w = pad.shape[:2]
+        if h == 0 or w == 0:
+            return ""
+        scaled = cv2.resize(pad, (int(w * 48.0 / h), 48),
+                            interpolation=cv2.INTER_AREA)
+        recogniser = getattr(ocr_engine, "ocr", None)
+        if recogniser is None:
+            return ""
+        preds, _ = recogniser.text_recognizer([scaled])
+        if preds and preds[0] and preds[0][0]:
+            return str(preds[0][0]).strip()
+    except Exception:
+        return ""
+    return ""
+
+
 def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
                        ocr_engine=None) -> str:
     """Read the handwriting in one box row using the existing OCR engine.
@@ -545,20 +570,70 @@ def read_box_row_strip(image_bgr: np.ndarray, row: BoxRow,
                 x1=row.boxes[first][0],
                 x2=row.boxes[last][0] + row.boxes[last][2])
         _raw, pad = _row_strip_images(image_bgr, row, ocr_engine)
-        if pad is None:
-            return ""
-        h, w = pad.shape[:2]
-        scaled = cv2.resize(pad, (int(w * 48.0 / h), 48),
-                            interpolation=cv2.INTER_AREA)
-        recogniser = getattr(ocr_engine, "ocr", None)
-        if recogniser is None:
-            return ""
-        preds, _ = recogniser.text_recognizer([scaled])
-        if preds and preds[0] and preds[0][0]:
-            return str(preds[0][0]).strip()
+        return _recognise_strip(pad, ocr_engine)
     except Exception:
         return ""
     return ""
+
+
+def read_box_row_strip_candidates(image_bgr: np.ndarray, row: BoxRow,
+                                  ocr_engine=None) -> List[str]:
+    """All readings of one box row, best (red-drop) first.
+
+    The same strip is read three ways, because no single cleaning
+    wins on every handwriting: (1) red-drop — the current reading,
+    best on most sheets; (2) ink-binary — the ink map (255 - R)
+    thresholded at 120, which reads clean block capitals the
+    red-drop smears (PRIYA's name reads 'PRIVA' here, 0.8 similar
+    to the roster, vs 'PRHNA', 0.6, red-drop); (3) raw — no red
+    removal at all. Duplicates and empty readings are dropped.
+    Callers try them in order and keep the first that reconciles
+    against the roster, so the current behaviour is unchanged when
+    the red-drop reading already matches.
+    """
+    if ocr_engine is None or row is None:
+        return []
+    try:
+        span = _filled_box_span(image_bgr, row)
+        if span is None:
+            if row.boxes:
+                return []
+        else:
+            first, last = span
+            row = replace(
+                row,
+                x1=row.boxes[first][0],
+                x2=row.boxes[last][0] + row.boxes[last][2])
+        raw, pad = _row_strip_images(image_bgr, row, ocr_engine)
+        if raw is None or pad is None:
+            return []
+        out: List[str] = []
+        for text in (_recognise_strip(pad, ocr_engine),
+                     _recognise_strip(_ink_binary_strip(raw), ocr_engine),
+                     _recognise_strip(_zoom_pad(raw), ocr_engine)):
+            if text and text not in out:
+                out.append(text)
+        return out
+    except Exception:
+        return []
+
+
+def _ink_binary_strip(raw: np.ndarray) -> np.ndarray:
+    """Ink-binary version of a raw strip: the ink map (255 - R)
+    thresholded at 120, as a white-background 3-channel image at
+    the same 2.5x zoom + padding as the red-drop strip."""
+    ink = ink_map(raw)
+    binary = np.where(ink > 120, 0, 255).astype(np.uint8)
+    binary = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    return _zoom_pad(binary)
+
+
+def _zoom_pad(strip: np.ndarray) -> np.ndarray:
+    """2.5x zoom + white padding, matching _row_strip_images."""
+    zoomed = cv2.resize(strip, None, fx=2.5, fy=2.5,
+                        interpolation=cv2.INTER_CUBIC)
+    return cv2.copyMakeBorder(zoomed, 15, 15, 30, 30,
+                              cv2.BORDER_CONSTANT, value=[255, 255, 255])
 
 
 @dataclass
@@ -569,6 +644,11 @@ class DynamicIdentity:
     method: str = ""            # "label" | "row-order" | "none"
     hall_ticket_row: Optional[BoxRow] = None
     name_row: Optional[BoxRow] = None
+    # Alternate readings of the name strip (red-drop first, then
+    # ink-binary, then raw — see read_box_row_strip_candidates).
+    # The primary name is the first of these; callers try the rest
+    # only when the primary does not reconcile against the roster.
+    name_candidates: List[str] = field(default_factory=list)
 
 
 def extract_identity_dynamic(image_bgr: np.ndarray,
@@ -608,11 +688,23 @@ def extract_identity_dynamic(image_bgr: np.ndarray,
 
     ht_text = read_box_row_strip(image_bgr, ht_row, ocr_engine) if ht_row else ""
     name_text = read_box_row_strip(image_bgr, name_row, ocr_engine) if name_row else ""
+    name_candidates = (read_box_row_strip_candidates(image_bgr, name_row, ocr_engine)
+                       if name_row else [])
 
     # Same cleaning as OCREngine: keep only letters/digits, upper case.
     ht_clean = re.sub(r"[^A-Za-z0-9]", "", ht_text).upper()
     name_clean = re.sub(r"[^A-Za-z ]", " ", name_text).upper()
     name_clean = " ".join(name_clean.split())
+    name_cands_clean = []
+    for cand in name_candidates:
+        c = re.sub(r"[^A-Za-z ]", " ", cand).upper()
+        c = " ".join(c.split())
+        if c and c not in name_cands_clean:
+            name_cands_clean.append(c)
+    if name_clean and name_clean not in name_cands_clean:
+        name_cands_clean.insert(0, name_clean)
+    elif not name_clean and name_cands_clean:
+        name_clean = name_cands_clean[0]
     if ht_clean:
         # Fix look-alike misreads (0/O, 5/S, J/1) against the exam
         # prefix when one is known — a mismatched prefix is ignored.
@@ -635,7 +727,121 @@ def extract_identity_dynamic(image_bgr: np.ndarray,
         conf = 0.9
     return DynamicIdentity(hall_ticket=ht_clean, name=name_clean,
                            confidence=conf, method=method,
-                           hall_ticket_row=ht_row, name_row=name_row)
+                           hall_ticket_row=ht_row, name_row=name_row,
+                           name_candidates=name_cands_clean)
+
+
+@dataclass
+class DailyTestIdentity:
+    """Identity from a daily-test (20Q) strip: B No (batch), ID No,
+    name. The values are handwritten in a small table at the top
+    right — the B No and ID No sit in cells BELOW their labels, not
+    beside them — so they are read by targeted label-anchored crops
+    (see extract_identity_20q), not by box rows."""
+    b_no: str = ""
+    id_no: str = ""
+    name: str = ""
+    b_no_candidates: List[str] = field(default_factory=list)
+    id_no_candidates: List[str] = field(default_factory=list)
+    name_candidates: List[str] = field(default_factory=list)
+
+
+def _recognise_crop(raw_crop: np.ndarray, ocr_engine,
+                    zoom: float = 2.5) -> str:
+    """Read one handwriting crop with the recogniser.
+
+    Red-drops the crop, zooms it (2.5x by default; 4.0x reads the
+    short B No cell better on some sheets), pads white, then runs
+    the recogniser. The full ocr() detector returns "" on these
+    small crops, so the recogniser is called directly.
+    """
+    if raw_crop is None or raw_crop.size == 0 or ocr_engine is None:
+        return ""
+    try:
+        remove_red = getattr(ocr_engine, "remove_red_color", None)
+        strip = remove_red(raw_crop) if remove_red is not None else raw_crop
+        zoomed = cv2.resize(strip, None, fx=zoom, fy=zoom,
+                            interpolation=cv2.INTER_CUBIC)
+        pad = cv2.copyMakeBorder(zoomed, 15, 15, 30, 30,
+                                 cv2.BORDER_CONSTANT, value=[255, 255, 255])
+        return _recognise_strip(pad, ocr_engine)
+    except Exception:
+        return ""
+
+
+def _label_by_norm(labels: List[Dict], *needles: str) -> Optional[Dict]:
+    """The first label whose space-stripped norm contains a needle
+    ('bno', 'idno', 'nameofthecandidate'). RapidOCR returns the B
+    No label as 'BNo.:' on one sheet and 'B No.:' on another, so
+    spaces must be ignored — the same rule as _row_for_label."""
+    for lab in labels:
+        norm = lab["norm"].replace(" ", "")
+        if any(n.replace(" ", "") in norm for n in needles):
+            return lab
+    return None
+
+
+def extract_identity_20q(image_bgr: np.ndarray,
+                         ocr_engine=None) -> DailyTestIdentity:
+    """Read B No / ID No / name from a daily-test (20Q) strip.
+
+    The strip has no hall-ticket box row: the name is written in
+    boxes right of the 'Name of the Candidate' label, and the B No
+    (one wide cell) and ID No (3 digit boxes) sit in cells BELOW
+    the 'B No.:' and 'ID No.:' labels at the top right. Each value
+    is read from its cell with the recogniser (red-drop; the B No
+    and ID No are also read at 4.0x, because neither zoom wins on
+    every sheet — LAKSHMAN's 'T9' needs 4.0x, K HYMA's 'T15' needs
+    2.5x). The roster matcher tries the candidates in order, so a
+    wrong zoom reading cannot win over a right one that matches a
+    real student.
+    """
+    out = DailyTestIdentity()
+    if ocr_engine is None:
+        return out
+    labels = find_labels(image_bgr, ocr_engine=ocr_engine)
+    if not labels:
+        return out
+
+    name_lab = _label_by_norm(labels, "nameofthecandidate", "name")
+    if name_lab is not None:
+        x1 = int(name_lab["x2"]) + 2
+        x2 = min(image_bgr.shape[1], x1 + 480)
+        y1 = max(0, int(name_lab["y1"]) - 4)
+        y2 = int(name_lab["y2"]) + 4
+        crop = image_bgr[y1:y2, x1:x2]
+        cands = []
+        for text in (_recognise_crop(crop, ocr_engine, 2.5),
+                     _recognise_strip(_ink_binary_strip(crop), ocr_engine),
+                     _recognise_crop(crop, ocr_engine, 4.0)):
+            c = re.sub(r"[^A-Za-z ]", " ", text).upper()
+            c = " ".join(c.split())
+            if c and c not in cands:
+                cands.append(c)
+        if cands:
+            out.name = cands[0]
+            out.name_candidates = cands
+
+    for key, needle in (("b_no", "bno"), ("id_no", "idno")):
+        lab = _label_by_norm(labels, needle)
+        if lab is None:
+            continue
+        # The value cell is directly below the label.
+        x1 = max(0, int(lab["x1"]) - 4)
+        x2 = int(lab["x2"]) + 4
+        y1 = int(lab["y2"]) + 1
+        y2 = min(image_bgr.shape[0], y1 + 46)
+        crop = image_bgr[y1:y2, x1:x2]
+        cands = []
+        for text in (_recognise_crop(crop, ocr_engine, 2.5),
+                     _recognise_crop(crop, ocr_engine, 4.0)):
+            c = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+            if c and c not in cands:
+                cands.append(c)
+        if cands:
+            setattr(out, key, cands[0])
+            setattr(out, f"{key}_candidates", cands)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +936,26 @@ def _split_wide_block(mask: np.ndarray, rect: Tuple[int, int, int, int],
     return out if len(out) >= 2 else []
 
 
+def _rows_per_column(expected_questions: Optional[int],
+                     n_cols: int) -> List[int]:
+    """How many question rows each answer column holds.
+
+    Questions fill down each column, left to right, so every column
+    but the last holds the same count and the last column holds the
+    remainder: 50 questions over 4 columns is 13, 13, 13, 11 (the
+    50Q grand-test sheet), not 12 each. An exact split gives equal
+    counts (200/5 = 40 each, 150/3 = 50 each, 20/4 = 5 each).
+    Falls back to 40 per column when no count is given.
+    """
+    if not expected_questions or n_cols <= 0:
+        return [40] * n_cols
+    n = int(expected_questions)
+    base = -(-n // n_cols)  # ceil(n / n_cols) for the full columns
+    rows = [base] * (n_cols - 1)
+    rows.append(n - base * (n_cols - 1))
+    return rows
+
+
 def _find_answer_columns(image_bgr: np.ndarray,
                          search_y1: int) -> List[Tuple[int, int, int, int]]:
     """Find the large pink answer-column rectangles below search_y1.
@@ -740,6 +966,11 @@ def _find_answer_columns(image_bgr: np.ndarray,
     the page height) and narrow (8-18% of the page width). A block
     wider than one column (the 150Q sheet joins three columns into
     one pink block) is split at its white gaps instead of dropped.
+    A short wide block also counts as a column: the 20Q daily-test
+    strip has 4 columns of 5 rows each, each about 17% of the page
+    wide and 37% of the page tall — wide, not tall — so a rectangle
+    at least 20% of the page tall and 8% of the page wide is a
+    column too, even when it is wider than it is tall.
     Returns (x1, y1, x2, y2) sorted left to right.
     """
     h, w = image_bgr.shape[:2]
@@ -751,7 +982,7 @@ def _find_answer_columns(image_bgr: np.ndarray,
     wide = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if bh < h * 0.35 or bw < w * 0.05:
+        if bh < h * 0.20 or bw < w * 0.05:
             continue
         if bw > w * 0.25:
             # Possibly several answer columns joined into one pink
@@ -759,9 +990,12 @@ def _find_answer_columns(image_bgr: np.ndarray,
             # it, or the sheet yields no bubbles at all.
             wide.append((x, y, x + bw, y + bh))
             continue
-        if bh < bw * 3:
-            continue
-        cols.append((x, y, x + bw, y + bh))
+        if bh >= h * 0.35 and bh >= bw * 3:
+            # Tall narrow column (40-row sheets).
+            cols.append((x, y, x + bw, y + bh))
+        elif bh >= 60 and bw >= w * 0.08:
+            # Short wide column (20Q strip: 5 rows, wider than tall).
+            cols.append((x, y, x + bw, y + bh))
     cols.sort(key=lambda c: c[0])
     # Merge overlapping detections of the same column.
     merged = []
@@ -775,7 +1009,9 @@ def _find_answer_columns(image_bgr: np.ndarray,
     for rect in wide:
         for piece in _split_wide_block(mask, rect, w):
             pw, ph = piece[2] - piece[0], piece[3] - piece[1]
-            if ph >= 3 * pw and w * 0.05 <= pw <= w * 0.25:
+            if w * 0.05 <= pw <= w * 0.25 and (
+                    (ph >= h * 0.35 and ph >= 3 * pw)
+                    or (ph >= h * 0.20 and ph >= 60 and pw >= w * 0.08)):
                 merged.append(piece)
     merged.sort(key=lambda c: c[0])
     return merged
@@ -943,7 +1179,10 @@ def _grid_rows_from_columns(image_bgr: np.ndarray,
     on a regular grid derived from the sheet itself:
       * number of columns = number of pink column rectangles found
       * rows per column = expected_questions / columns (from the key
-        PDF count; falls back to 40 when no count is given)
+        PDF count; falls back to 40 when no count is given) — the
+        last column holds the remainder when the count does not
+        divide evenly (50 questions over 4 columns is 13, 13, 13,
+        11, not 12 each; see _rows_per_column)
       * row pitch = column height / rows per column
       * the 4 circle x-positions per column come from peaks in the
         candidate-centre x histogram inside that column; when too
@@ -962,13 +1201,9 @@ def _grid_rows_from_columns(image_bgr: np.ndarray,
     if not columns:
         return []
     n_cols = len(columns)
-    rows_per_col = 40
-    if expected_questions and expected_questions % n_cols == 0:
-        rows_per_col = expected_questions // n_cols
-    elif expected_questions:
-        rows_per_col = int(round(expected_questions / n_cols))
+    rows_list = _rows_per_column(expected_questions, n_cols)
     out: List[Tuple[float, float, float, float]] = []
-    for (x1, y1, x2, y2) in columns:
+    for (x1, y1, x2, y2), rows_per_col in zip(columns, rows_list):
         col_w, col_h = float(x2 - x1), float(y2 - y1)
         pitch_y = col_h / float(rows_per_col)
         cands = _candidate_centres(image_bgr, (x1, y1, x2, y2))
