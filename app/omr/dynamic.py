@@ -389,6 +389,69 @@ def _row_strip_images(image_bgr: np.ndarray, row: BoxRow,
     return raw, pad
 
 
+def _rect_strip_images(image_bgr: np.ndarray,
+                       rect: Tuple[int, int, int, int],
+                       ocr_engine=None):
+    """Raw + cleaned strip images for one rectangle (x1, y1, x2, y2).
+
+    Same cleaning as _row_strip_images (red dropout, 2.5x zoom,
+    white padding). Returns (None, None) when the rectangle has
+    no pixels.
+    """
+    x1, y1, x2, y2 = rect
+    h, w = image_bgr.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None, None
+    raw = image_bgr[y1:y2, x1:x2]
+    if raw.size == 0:
+        return None, None
+    strip = raw
+    remove_red = getattr(ocr_engine, "remove_red_color", None) if ocr_engine else None
+    if remove_red is not None:
+        strip = remove_red(strip)
+    zoomed = cv2.resize(strip, None, fx=2.5, fy=2.5,
+                        interpolation=cv2.INTER_CUBIC)
+    pad = cv2.copyMakeBorder(zoomed, 15, 15, 30, 30,
+                             cv2.BORDER_CONSTANT, value=[255, 255, 255])
+    return raw, pad
+
+
+def daily_test_crops(image_bgr: np.ndarray, daily: "DailyTestIdentity",
+                     ocr_engine=None) -> Dict:
+    """Crop images for a daily-test (20Q) identity, in the same shape
+    as identity_crops (ht_processed, name_processed, ht_raw,
+    name_raw, ht_missing_on_sheet).
+
+    A 20Q strip has no hall-ticket box row, so the dynamic
+    identity's rows point at the wrong places (the name boxes as
+    'hall ticket', a bubble row as 'name'). The correct crops are
+    the B No / ID No table at the top right (as the 'HT' crop) and
+    the name boxes right of the 'Name of the Candidate' label (as
+    the 'name' crop) — the rectangles extract_identity_20q already
+    found. A missing rectangle yields a blank white placeholder.
+    """
+    crops: Dict = {"ht_missing_on_sheet": False}
+    blank = np.full((50, 200, 3), 255, dtype=np.uint8)
+    if daily.id_rect is not None:
+        raw, pad = _rect_strip_images(image_bgr, daily.id_rect, ocr_engine)
+        crops["ht_raw"] = raw if raw is not None else blank
+        crops["ht_processed"] = pad if pad is not None else blank
+    else:
+        crops["ht_raw"] = blank
+        crops["ht_processed"] = blank
+        crops["ht_missing_on_sheet"] = True
+    if daily.name_rect is not None:
+        raw, pad = _rect_strip_images(image_bgr, daily.name_rect, ocr_engine)
+        crops["name_raw"] = raw if raw is not None else blank
+        crops["name_processed"] = pad if pad is not None else blank
+    else:
+        crops["name_raw"] = blank
+        crops["name_processed"] = blank
+    return crops
+
+
 def identity_crops(image_bgr: np.ndarray, identity: "DynamicIdentity",
                    ocr_engine=None) -> Dict:
     """Crop images for a dynamic identity, in the same shape as the
@@ -783,6 +846,15 @@ class DailyTestIdentity:
     b_no_candidates: List[str] = field(default_factory=list)
     id_no_candidates: List[str] = field(default_factory=list)
     name_candidates: List[str] = field(default_factory=list)
+    # Crop rectangles (x1, y1, x2, y2) on the same image, for the
+    # review crops: name_rect is the name-boxes area right of the
+    # 'Name of the Candidate' label; id_rect is the B No / ID No
+    # table at the top right (labels + value cells). The dynamic
+    # identity's box rows are meaningless on a 20Q strip (it has no
+    # hall-ticket row), so the batch builds the 20Q crops from
+    # these rectangles instead. None when the label was not found.
+    name_rect: Optional[Tuple[int, int, int, int]] = None
+    id_rect: Optional[Tuple[int, int, int, int]] = None
 
 
 def _recognise_crop(raw_crop: np.ndarray, ocr_engine,
@@ -821,7 +893,8 @@ def _label_by_norm(labels: List[Dict], *needles: str) -> Optional[Dict]:
 
 
 def extract_identity_20q(image_bgr: np.ndarray,
-                         ocr_engine=None) -> DailyTestIdentity:
+                         ocr_engine=None,
+                         labels: Optional[List[Dict]] = None) -> DailyTestIdentity:
     """Read B No / ID No / name from a daily-test (20Q) strip.
 
     The strip has no hall-ticket box row: the name is written in
@@ -834,11 +907,20 @@ def extract_identity_20q(image_bgr: np.ndarray,
     2.5x). The roster matcher tries the candidates in order, so a
     wrong zoom reading cannot win over a right one that matches a
     real student.
+
+    `labels`, when given, is the full-page OCR result already
+    computed by the caller (analyze_sheet_dynamic) on this same
+    image — it is reused instead of running the slow full-page
+    OCR a second time for this sheet. The crop rectangles of the
+    name boxes and the B No / ID No table are recorded on the
+    returned identity (name_rect, id_rect) so the batch can build
+    correct review crops for a 20Q sheet.
     """
     out = DailyTestIdentity()
     if ocr_engine is None:
         return out
-    labels = find_labels(image_bgr, ocr_engine=ocr_engine)
+    if labels is None:
+        labels = find_labels(image_bgr, ocr_engine=ocr_engine)
     if not labels:
         return out
 
@@ -848,6 +930,7 @@ def extract_identity_20q(image_bgr: np.ndarray,
         x2 = min(image_bgr.shape[1], x1 + 480)
         y1 = max(0, int(name_lab["y1"]) - 4)
         y2 = int(name_lab["y2"]) + 4
+        out.name_rect = (x1, y1, x2, y2)
         crop = image_bgr[y1:y2, x1:x2]
         cands = []
         for text in (_recognise_crop(crop, ocr_engine, 2.5),
@@ -861,6 +944,7 @@ def extract_identity_20q(image_bgr: np.ndarray,
             out.name = cands[0]
             out.name_candidates = cands
 
+    id_regions: List[Tuple[int, int, int, int]] = []
     for key, needle in (("b_no", "bno"), ("id_no", "idno")):
         lab = _label_by_norm(labels, needle)
         if lab is None:
@@ -870,6 +954,10 @@ def extract_identity_20q(image_bgr: np.ndarray,
         x2 = int(lab["x2"]) + 4
         y1 = int(lab["y2"]) + 1
         y2 = min(image_bgr.shape[0], y1 + 46)
+        # The table region for the review crop spans this label and
+        # its value cell.
+        id_regions.append((max(0, int(lab["x1"]) - 4),
+                           max(0, int(lab["y1"]) - 4), x2, y2))
         crop = image_bgr[y1:y2, x1:x2]
         cands = []
         for text in (_recognise_crop(crop, ocr_engine, 2.5),
@@ -880,6 +968,11 @@ def extract_identity_20q(image_bgr: np.ndarray,
         if cands:
             setattr(out, key, cands[0])
             setattr(out, f"{key}_candidates", cands)
+    if id_regions:
+        out.id_rect = (min(r[0] for r in id_regions),
+                       min(r[1] for r in id_regions),
+                       max(r[2] for r in id_regions),
+                       max(r[3] for r in id_regions))
     return out
 
 
@@ -1350,6 +1443,11 @@ class DynamicSheet:
     found_questions: int = 0
     method: str = ""            # "dynamic" | "dynamic-partial" | "none"
     warnings: List[str] = field(default_factory=list)
+    # Full-page OCR labels already computed for this sheet (see
+    # analyze_sheet_dynamic). Callers that need another label-anchored
+    # read on the same image (e.g. the 20Q reader) reuse these
+    # instead of running the slow full-page OCR again.
+    labels: List[Dict] = field(default_factory=list)
 
 
 def analyze_sheet_dynamic(image_bgr: np.ndarray,
@@ -1383,12 +1481,12 @@ def analyze_sheet_dynamic(image_bgr: np.ndarray,
     if not columns:
         warnings.append("No answer columns found below ANSWERS.")
         return DynamicSheet(identity=identity, expected_questions=expected_questions,
-                            method="none", warnings=warnings)
+                            method="none", warnings=warnings, labels=labels)
     grid = _grid_rows_from_columns(image_bgr, columns, expected_questions)
     if not grid:
         warnings.append("No bubble grid found in the answer columns.")
         return DynamicSheet(identity=identity, expected_questions=expected_questions,
-                            method="none", warnings=warnings)
+                            method="none", warnings=warnings, labels=labels)
 
     # Group the flat grid list back into rows: 4 bubbles per row,
     # rows in column-major order (down each column, then next column).
@@ -1432,7 +1530,7 @@ def analyze_sheet_dynamic(image_bgr: np.ndarray,
     return DynamicSheet(identity=identity, rows=result_rows,
                         expected_questions=expected_questions,
                         found_questions=found, method=method,
-                        warnings=warnings)
+                        warnings=warnings, labels=labels)
 
 
 def dynamic_rows_to_detected(sheet: DynamicSheet) -> Dict[int, Dict]:
