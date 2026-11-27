@@ -335,7 +335,7 @@ def infer_prefix_from_roster(roster_records: List[Dict[str, str]]) -> Optional[s
     return None
 
 
-def detect_batch_prefix(image_files: List[Path], engine: OCREngine, sample_limit: int = 15) -> Optional[str]:
+def detect_batch_prefix(image_files: List[Path], engine: OCREngine, sample_limit: int = 5) -> Optional[str]:
     """
     Dynamically infers the shared exam prefix from the scanned sheets in the folder,
     without any hardcoded exam codes. If no shared prefix is detected, returns None.
@@ -344,6 +344,11 @@ def detect_batch_prefix(image_files: List[Path], engine: OCREngine, sample_limit
     batch run uses and takes the letter prefix of the hall ticket it
     reads (the part before the roll digits). At least two sheets must
     agree — a single misread must not set the prefix for the batch.
+
+    Stops as soon as two sheets agree (a homogeneous batch normally
+    agrees on the first two), so the prefix scan costs ~2 sheets
+    instead of re-reading up to `sample_limit` sheets before the
+    batch even starts.
     """
     prefixes = []
     for fpath in image_files[:sample_limit]:
@@ -363,25 +368,39 @@ def detect_batch_prefix(image_files: List[Path], engine: OCREngine, sample_limit
                 prefixes.append(m.group(1))
         except Exception:
             continue
+        # Early exit: two compatible prefixes are enough — a single
+        # misread must not set the prefix, but there is no need to
+        # keep reading more sheets once two agree.
+        shared = _shared_prefix(prefixes)
+        if shared:
+            return shared
 
-    if prefixes:
-        # Prefixes from different sheets can differ by a fused
-        # character: one sheet reads 'AP05C' (handwritten J + 1
-        # fused into a single '1') while another reads the full
-        # 'AP05CJ'. They are compatible when one is a string-prefix
-        # of the other, so group by that and take the longest prefix
-        # of the largest compatible group. At least two sheets must
-        # agree — a single misread must not set the prefix.
-        uniq = sorted(set(prefixes), key=len, reverse=True)
-        best_prefix = None
-        best_count = 0
-        for cand in uniq:
-            group = [p for p in prefixes
-                     if p.startswith(cand) or cand.startswith(p)]
-            if len(group) > best_count:
-                best_prefix, best_count = cand, len(group)
-        if best_count >= 2 and best_prefix:
-            return best_prefix
+    return _shared_prefix(prefixes)
+
+
+def _shared_prefix(prefixes: List[str]) -> Optional[str]:
+    """Longest prefix of the largest compatible group, or None.
+
+    Prefixes from different sheets can differ by a fused character:
+    one sheet reads 'AP05C' (handwritten J + 1 fused into a single
+    '1') while another reads the full 'AP05CJ'. They are compatible
+    when one is a string-prefix of the other, so group by that and
+    take the longest prefix of the largest compatible group. At
+    least two sheets must agree — a single misread must not set
+    the prefix.
+    """
+    if not prefixes:
+        return None
+    uniq = sorted(set(prefixes), key=len, reverse=True)
+    best_prefix = None
+    best_count = 0
+    for cand in uniq:
+        group = [p for p in prefixes
+                 if p.startswith(cand) or cand.startswith(p)]
+        if len(group) > best_count:
+            best_prefix, best_count = cand, len(group)
+    if best_count >= 2 and best_prefix:
+        return best_prefix
     return None
 
 
