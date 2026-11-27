@@ -673,7 +673,8 @@ class DynamicIdentity:
 
 def extract_identity_dynamic(image_bgr: np.ndarray,
                              ocr_engine=None,
-                             exam_prefix: Optional[str] = None
+                             exam_prefix: Optional[str] = None,
+                             labels: Optional[List[Dict]] = None
                              ) -> DynamicIdentity:
     """Find hall ticket + name without any fixed coordinates.
 
@@ -685,9 +686,14 @@ def extract_identity_dynamic(image_bgr: np.ndarray,
        (>= 8 boxes) in the top area are hall ticket, then name.
        (Gender has few boxes; Community/District come after.)
     4. Read each chosen row with the OCR engine, if available.
+
+    `labels`, when given, is the full-page OCR result already
+    computed by the caller (analyze_sheet_dynamic) — it is reused
+    here instead of running the slow full-page OCR a second time.
     """
     rows = find_box_rows(image_bgr)
-    labels = find_labels(image_bgr, ocr_engine=ocr_engine)
+    if labels is None:
+        labels = find_labels(image_bgr, ocr_engine=ocr_engine)
 
     ht_row = _row_for_label(rows, labels, "hall ticket")
     name_row = _row_for_label(rows, labels, "name of the candidate",
@@ -1316,14 +1322,20 @@ def _group_circles_into_rows(circles: List[Tuple[float, float, float]],
     return out
 
 
-def _answers_start_y(image_bgr: np.ndarray, ocr_engine=None) -> int:
+def _answers_start_y(image_bgr: np.ndarray, ocr_engine=None,
+                     labels: Optional[List[Dict]] = None) -> int:
     """Y below which answer bubbles live: under the ANSWERS heading.
 
     Falls back to the top third of the page when the heading text
     cannot be read — the identity / booklet area is above that.
+
+    `labels`, when given, is the full-page OCR result already
+    computed by the caller — it is reused instead of running the
+    slow full-page OCR a second time for the same image.
     """
     h, _w = image_bgr.shape[:2]
-    labels = find_labels(image_bgr, ocr_engine=ocr_engine)
+    if labels is None:
+        labels = find_labels(image_bgr, ocr_engine=ocr_engine)
     for lab in labels:
         if "answer" in lab["norm"]:
             return int(lab["y2"]) + 5
@@ -1356,10 +1368,17 @@ def analyze_sheet_dynamic(image_bgr: np.ndarray,
     used only to fix look-alike misreads in the hall ticket.
     """
     warnings: List[str] = []
+    # The full-page OCR is the slowest step (several seconds), so
+    # run it ONCE for this sheet and share the labels between the
+    # identity reader and the ANSWERS-heading search below. Reading
+    # the same page twice was the single biggest cost per sheet.
+    labels = find_labels(image_bgr, ocr_engine=ocr_engine)
     identity = extract_identity_dynamic(image_bgr, ocr_engine=ocr_engine,
-                                        exam_prefix=exam_prefix)
+                                        exam_prefix=exam_prefix,
+                                        labels=labels)
 
-    start_y = _answers_start_y(image_bgr, ocr_engine=ocr_engine)
+    start_y = _answers_start_y(image_bgr, ocr_engine=ocr_engine,
+                               labels=labels)
     columns = _find_answer_columns(image_bgr, search_y1=start_y)
     if not columns:
         warnings.append("No answer columns found below ANSWERS.")
