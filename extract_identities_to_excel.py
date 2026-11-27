@@ -852,7 +852,8 @@ def process_folder(
             try:
                 from app.omr.dynamic import (
                     analyze_sheet_dynamic, dynamic_rows_to_detected,
-                    extract_identity_20q, identity_crops, top_is_cut_off,
+                    daily_test_crops, extract_identity_20q, identity_crops,
+                    top_is_cut_off,
                 )
                 top_cut = top_is_cut_off(aligned)
                 no_track = (len(left_marks) < 2
@@ -888,7 +889,19 @@ def process_folder(
                     is_daily = True
                 if is_daily:
                     try:
-                        daily = extract_identity_20q(dyn_image, engine)
+                        # Reuse the full-page OCR labels analyze already
+                        # computed for this sheet — the 20Q reader would
+                        # otherwise run the slow full-page OCR a second
+                        # time for the same image.
+                        daily = extract_identity_20q(dyn_image, engine,
+                                                     labels=dyn.labels)
+                        # The dynamic identity's box rows are meaningless
+                        # on a 20Q strip (no hall-ticket row), so its
+                        # crops point at the wrong places. Replace them
+                        # with crops from the 20Q reader's own
+                        # rectangles: the B No / ID No table and the
+                        # name boxes.
+                        crops = daily_test_crops(dyn_image, daily, engine)
                         matched = (None, None, None)
                         if roster_records:
                             for b_cand in daily.b_no_candidates or [""]:
